@@ -1,0 +1,15 @@
+{
+  "version": "v41",
+  "interval": "30m",
+  "leverage": 3,
+  "steps": 2000000,
+  "train_end": "2025-09-01",
+  "train_start": "2023-12-21",
+  "train_end_actual": "2025-09-01",
+  "test_start": "2025-09-01",
+  "test_end": "2026-03-19",
+  "train_candles": 29760,
+  "test_candles": 9572,
+  "features": 10,
+  "env": "ETHTradingEnvV41"
+}

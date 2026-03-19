@@ -1,0 +1,13 @@
+{
+  "interval": "30m",
+  "version": "v4",
+  "steps": 1000000,
+  "split": null,
+  "train_end": "2025-09-01",
+  "train_start": "2025-03-20",
+  "train_end_actual": "2025-09-01",
+  "test_start": "2025-09-01",
+  "test_end": "2026-03-18",
+  "train_candles": 7920,
+  "test_candles": 9534
+}

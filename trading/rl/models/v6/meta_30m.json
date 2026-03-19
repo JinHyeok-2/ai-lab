@@ -1,0 +1,14 @@
+{
+  "version": "v6",
+  "interval": "30m",
+  "leverage": 3,
+  "n_envs": 4,
+  "steps": 2000000,
+  "vecnorm": true,
+  "train_start": "2025-03-20",
+  "train_end": "2026-01-04",
+  "test_start": "2026-01-04",
+  "test_end": "2026-03-18",
+  "train_candles": 13963,
+  "test_candles": 3491
+}
