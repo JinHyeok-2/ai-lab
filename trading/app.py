@@ -10,6 +10,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+import threading
 import plotly.graph_objects as go
 
 # ── 페이지 설정 ────────────────────────────────────────────────────
@@ -89,7 +90,7 @@ p, span, div, label, h1, h2, h3, h4, h5 { color: #111; }
 try:
     import sys, os
     sys.path.insert(0, str(Path(__file__).parent))
-    from binance_client import get_klines, get_price, get_balance, get_positions, place_order, close_position, get_funding_rate, get_recent_trades, update_stop_loss, get_funding_rate_history, get_open_interest, partial_close_position
+    from binance_client import get_klines, get_price, get_balance, get_positions, place_order, close_position, get_funding_rate, get_recent_trades, update_stop_loss, get_funding_rate_history, get_open_interest, partial_close_position, cancel_open_orders, get_open_orders, get_client, _get_symbol_filters, _round_price
     from indicators import calc_indicators, format_for_agent
     from agents import run_agent
     from config import SYMBOLS, LEVERAGE, MAX_USDT, INTERVAL, CANDLE_CNT, TESTNET
@@ -114,8 +115,8 @@ except Exception as e:
     TESTNET      = True
     TELEGRAM_TOKEN   = ""
     TELEGRAM_CHAT_ID = ""
-    ATR_SL_MULT    = 1.5
-    ATR_TP_MULT    = 3.0
+    ATR_SL_MULT    = 2.0
+    ATR_TP_MULT    = 4.0
     MAX_DAILY_LOSS = 200
     MAX_USDT_ALT      = 50
     MAX_ALT_POSITIONS = 2
@@ -182,25 +183,45 @@ def _load_history() -> list:
     return []
 
 _JOURNAL_PATH = Path(__file__).parent / "trade_journal.json"
+_journal_lock = threading.Lock()
+
+# ── 모니터링 함수 debounce (중복 실행 방지) ────────────────────────────
+_last_check_ts = {}
+def _debounce(func_name: str, min_interval: float = 10.0) -> bool:
+    """최소 간격 이내 재호출이면 True(스킵), 아니면 False(실행)"""
+    now = time.time()
+    if now - _last_check_ts.get(func_name, 0) < min_interval:
+        return True
+    _last_check_ts[func_name] = now
+    return False
 
 def _load_journal() -> list:
-    try:
-        if _JOURNAL_PATH.exists():
-            return json.loads(_JOURNAL_PATH.read_text())
-    except Exception:
-        pass
-    return []
+    with _journal_lock:
+        try:
+            if _JOURNAL_PATH.exists():
+                return json.loads(_JOURNAL_PATH.read_text())
+        except Exception:
+            pass
+        return []
 
 def _save_journal(journal: list):
-    try:
-        _JOURNAL_PATH.write_text(json.dumps(journal[-200:], ensure_ascii=False, indent=2))
-    except Exception:
-        pass
+    with _journal_lock:
+        try:
+            _JOURNAL_PATH.write_text(json.dumps(journal[-200:], ensure_ascii=False, indent=2))
+        except Exception:
+            pass
 
 def _add_journal_entry(entry: dict):
-    j = _load_journal()
-    j.insert(0, entry)
-    _save_journal(j)
+    with _journal_lock:
+        try:
+            j = json.loads(_JOURNAL_PATH.read_text()) if _JOURNAL_PATH.exists() else []
+        except Exception:
+            j = []
+        j.insert(0, entry)
+        try:
+            _JOURNAL_PATH.write_text(json.dumps(j[-200:], ensure_ascii=False, indent=2))
+        except Exception:
+            pass
 
 def _update_journal_pnl(symbol: str, pnl: float, close_price: float = None):
     """심볼의 가장 최근 미청산(pnl=None) journal 항목에 PnL 기록"""
@@ -215,20 +236,292 @@ def _update_journal_pnl(symbol: str, pnl: float, close_price: float = None):
             break
     _save_journal(j)
 
+def _check_soft_sl():
+    """소프트 SL 체크 — 박스권(ADX<20) 포지션의 캔들 종가 기준 청산
+    STOP_MARKET(하드 SL)은 급락 안전망, 소프트 SL은 캔들 종가 확인 후 청산
+    """
+    if _debounce("soft_sl", 15):
+        return
+    if not BINANCE_READY:
+        return
+    try:
+        j = _load_journal()
+        # sl_mode="soft"인 열린 포지션만 대상
+        soft_entries = [
+            e for e in j
+            if e.get("pnl") is None and e.get("sl_mode") == "soft" and e.get("sl")
+        ]
+        if not soft_entries:
+            return
+        positions = get_positions()
+        pos_map = {p["symbol"]: p for p in positions}
+        for entry in soft_entries:
+            sym = entry["symbol"]
+            pos = pos_map.get(sym)
+            if not pos:
+                continue  # 이미 청산됨 — _check_sl_tp_closed()에서 처리
+            soft_sl = float(entry["sl"])
+            side = pos["side"]
+            # 최근 마감된 캔들의 종가 확인 (현재 캔들 제외 = limit 2의 첫번째)
+            try:
+                _df = get_klines(sym, interval=INTERVAL, limit=2)
+                if _df.empty or len(_df) < 2:
+                    continue
+                last_close = float(_df.iloc[-2]["close"])  # 마지막 확정 캔들
+            except Exception:
+                continue
+            # 캔들 종가가 소프트 SL을 돌파했는지 확인
+            _breached = False
+            if side == "LONG" and last_close <= soft_sl:
+                _breached = True
+            elif side == "SHORT" and last_close >= soft_sl:
+                _breached = True
+            if _breached:
+                _log(f"🔔 {sym} 소프트SL 캔들종가 돌파 (종가:${last_close:.2f}, SL:${soft_sl:.2f}) → 청산")
+                add_log(f"🔔 {sym} 소프트SL 발동: 캔들종가 ${last_close:.2f} → 시장가 청산")
+                r = close_position(sym)
+                if r.get("success"):
+                    # PnL 계산 (side 판별: pos["side"]가 가장 신뢰 가능)
+                    ep = pos["entry_price"]
+                    qty = entry.get("qty", pos["size"])
+                    if side == "LONG":
+                        _pnl = round((last_close - ep) * qty, 4)
+                    else:
+                        _pnl = round((ep - last_close) * qty, 4)
+                    _update_journal_pnl(sym, _pnl, last_close)
+                    add_log(f"📋 {sym} 소프트SL 청산 완료: PnL ${_pnl:+.2f}")
+                    if st.session_state.get("tg_notify"):
+                        send_error(st.session_state.tg_token, st.session_state.tg_chat_id,
+                                   f"🔔 {sym} 소프트SL 청산 | 종가 ${last_close:.2f} | PnL ${_pnl:+.2f}")
+                else:
+                    _log(f"소프트SL 청산 실패 {sym}: {r.get('error','')}", "error")
+    except Exception as e:
+        _log(f"소프트SL 체크 오류: {e}", "error")
+
+
+def _smart_exit_check():
+    """스마트 엑싯 — SL/TP 근접 시 지표 재평가 후 청산 or SL/TP 조정 결정
+    - SL 근접: RSI 과매도/과매수 반전 가능성 체크 → 조정 or 청산
+    - TP 근접: 모멘텀 지속 여부 체크 → 확장 or 익절
+    - 하드 SL/TP는 항상 유지 (절대 안전망)
+    """
+    if _debounce("smart_exit", 15):
+        return
+    if not BINANCE_READY:
+        return
+    if not st.session_state.get("smart_exit_on", True):
+        return
+    try:
+        j = _load_journal()
+        open_entries = [e for e in j if e.get("pnl") is None and e.get("symbol")]
+        if not open_entries:
+            return
+        positions = get_positions()
+        pos_map = {p["symbol"]: p for p in positions}
+        _updated = False
+        for entry in open_entries:
+            sym = entry["symbol"]
+            pos = pos_map.get(sym)
+            if not pos:
+                continue
+            sl = entry.get("sl")
+            tp = entry.get("tp")
+            atr = entry.get("atr", 0) or 0
+            if not sl or not tp or atr <= 0:
+                continue
+            sl, tp = float(sl), float(tp)
+            side = pos["side"]
+            ep = pos["entry_price"]
+            cur_price_approx = ep + (pos["unrealized_pnl"] / pos["size"]) if side == "LONG" else ep - (pos["unrealized_pnl"] / pos["size"])
+
+            # SL/TP 근접도 계산 (ATR 기준)
+            if side == "LONG":
+                sl_dist = (cur_price_approx - sl) / atr if atr else 99
+                tp_dist = (tp - cur_price_approx) / atr if atr else 99
+            else:
+                sl_dist = (sl - cur_price_approx) / atr if atr else 99
+                tp_dist = (cur_price_approx - tp) / atr if atr else 99
+
+            # 근접 임계값: 0.5 ATR 이내일 때 재평가
+            _NEAR_THRESHOLD = 0.5
+
+            if sl_dist > _NEAR_THRESHOLD and tp_dist > _NEAR_THRESHOLD:
+                continue  # SL/TP 둘 다 멀면 스킵
+
+            # 빠른 지표 조회 (에이전트 호출 없이 지표만)
+            try:
+                _df = get_klines(sym, interval=INTERVAL, limit=50)
+                if _df.empty or len(_df) < 20:
+                    continue
+                _ind = calc_indicators(_df)
+            except Exception:
+                continue
+
+            _rsi = _ind.get("rsi", 50) or 50
+            _adx = _ind.get("adx", 0) or 0
+            _macd_h = _ind.get("macd_hist", 0) or 0
+            _obv = _ind.get("obv_trend", "")
+            _stoch_k = _ind.get("stoch_k", 50) or 50
+            _max_adjust = int(entry.get("smart_adjust_count", 0))  # 최대 2회 조정
+
+            # ── SL 근접 재평가 ──
+            if sl_dist <= _NEAR_THRESHOLD and _max_adjust < 2:
+                _save_sl = False  # SL 살릴지 여부
+                _reasons = []
+
+                if side == "LONG":
+                    # 롱 SL 근접: 반등 가능성 체크
+                    if _rsi < 30:
+                        _save_sl = True
+                        _reasons.append(f"RSI 과매도({_rsi:.0f})")
+                    if _stoch_k < 20:
+                        _save_sl = True
+                        _reasons.append(f"StochK 과매도({_stoch_k:.0f})")
+                    if _macd_h > 0:
+                        _save_sl = True
+                        _reasons.append("MACD 히스토그램 양전환")
+                    if _adx < 20:
+                        _save_sl = True
+                        _reasons.append(f"약한 추세(ADX={_adx:.0f})")
+                else:
+                    # 숏 SL 근접: 하락 재개 가능성 체크
+                    if _rsi > 70:
+                        _save_sl = True
+                        _reasons.append(f"RSI 과매수({_rsi:.0f})")
+                    if _stoch_k > 80:
+                        _save_sl = True
+                        _reasons.append(f"StochK 과매수({_stoch_k:.0f})")
+                    if _macd_h < 0:
+                        _save_sl = True
+                        _reasons.append("MACD 히스토그램 음전환")
+                    if _adx < 20:
+                        _save_sl = True
+                        _reasons.append(f"약한 추세(ADX={_adx:.0f})")
+
+                # 2개 이상 근거가 있어야 SL 조정 (1개면 너무 약함)
+                if _save_sl and len(_reasons) >= 2:
+                    # SL을 0.5 ATR 더 뒤로 이동
+                    if side == "LONG":
+                        new_sl = round(sl - atr * 0.5, 2)
+                    else:
+                        new_sl = round(sl + atr * 0.5, 2)
+                    _r = update_stop_loss(sym, new_sl, side)
+                    if _r.get("success"):
+                        entry["sl"] = new_sl
+                        entry["smart_adjust_count"] = _max_adjust + 1
+                        _updated = True
+                        _reason_str = " + ".join(_reasons)
+                        add_log(f"🧠 {sym} 스마트SL 조정: ${sl:.2f}→${new_sl:.2f} ({_reason_str})")
+                        _log(f"🧠 스마트엑싯: {sym} SL 조정 {_max_adjust+1}/2회 | {_reason_str}")
+                        if st.session_state.get("tg_notify"):
+                            send_error(st.session_state.tg_token, st.session_state.tg_chat_id,
+                                       f"🧠 {sym} SL 조정: ${sl:.2f}→${new_sl:.2f} | {_reason_str}")
+
+            # ── TP 근접 재평가 ──
+            elif tp_dist <= _NEAR_THRESHOLD and _max_adjust < 2:
+                _extend_tp = False
+                _reasons = []
+
+                if side == "LONG":
+                    # 롱 TP 근접: 추가 상승 가능성 체크
+                    if _rsi < 75 and _rsi > 50:
+                        _extend_tp = True
+                        _reasons.append(f"RSI 여유({_rsi:.0f})")
+                    if _macd_h > 0 and _adx > 25:
+                        _extend_tp = True
+                        _reasons.append(f"모멘텀 강함(ADX={_adx:.0f})")
+                    if _obv == "상승":
+                        _extend_tp = True
+                        _reasons.append("OBV 상승")
+                else:
+                    # 숏 TP 근접: 추가 하락 가능성 체크
+                    if _rsi > 25 and _rsi < 50:
+                        _extend_tp = True
+                        _reasons.append(f"RSI 여유({_rsi:.0f})")
+                    if _macd_h < 0 and _adx > 25:
+                        _extend_tp = True
+                        _reasons.append(f"모멘텀 강함(ADX={_adx:.0f})")
+                    if _obv == "하락":
+                        _extend_tp = True
+                        _reasons.append("OBV 하락")
+
+                # 2개 이상 근거 시 TP 확장
+                if _extend_tp and len(_reasons) >= 2:
+                    # TP를 1 ATR 더 확장
+                    if side == "LONG":
+                        new_tp = round(tp + atr * 1.0, 2)
+                    else:
+                        new_tp = round(tp - atr * 1.0, 2)
+                    # TP는 TAKE_PROFIT_MARKET 주문 교체
+                    try:
+                        client = get_client()
+                        # 기존 TP 주문 취소
+                        _orders = client.futures_get_open_orders(symbol=sym)
+                        for _o in _orders:
+                            if _o["type"] == "TAKE_PROFIT_MARKET":
+                                try:
+                                    client.futures_cancel_order(symbol=sym, orderId=_o["orderId"])
+                                except Exception:
+                                    pass
+                        # 새 TP 배치
+                        _, tick_size = _get_symbol_filters(sym)
+                        tp_rounded = _round_price(new_tp, tick_size)
+                        tp_side = "SELL" if side == "LONG" else "BUY"
+                        client.futures_create_order(
+                            symbol=sym, side=tp_side,
+                            type="TAKE_PROFIT_MARKET",
+                            stopPrice=tp_rounded,
+                            closePosition=True,
+                        )
+                        entry["tp"] = new_tp
+                        entry["smart_adjust_count"] = _max_adjust + 1
+                        _updated = True
+                        _reason_str = " + ".join(_reasons)
+                        add_log(f"🧠 {sym} 스마트TP 확장: ${tp:.2f}→${new_tp:.2f} ({_reason_str})")
+                        _log(f"🧠 스마트엑싯: {sym} TP 확장 {_max_adjust+1}/2회 | {_reason_str}")
+                        if st.session_state.get("tg_notify"):
+                            send_error(st.session_state.tg_token, st.session_state.tg_chat_id,
+                                       f"🧠 {sym} TP 확장: ${tp:.2f}→${new_tp:.2f} | {_reason_str}")
+                    except Exception as _e:
+                        _log(f"스마트TP 확장 실패 {sym}: {_e}", "error")
+
+        if _updated:
+            _save_journal(j)
+    except Exception as e:
+        _log(f"스마트엑싯 체크 오류: {e}", "error")
+
+
 def _check_sl_tp_closed():
     """SL/TP 자동 청산 감지 — pnl=None 항목 중 포지션이 사라진 심볼 업데이트"""
+    if _debounce("sl_tp_closed", 10):
+        return
     j = _load_journal()
     open_entries = [e for e in j if e.get("pnl") is None and e.get("symbol")]
     if not open_entries:
         return
     try:
-        active_syms = {p["symbol"] for p in get_positions()}
+        _positions = get_positions()
+        active_syms = {p["symbol"] for p in _positions}
+        # 방어: 열린 저널이 있는데 포지션 API가 빈 결과면 → 오판 방지
+        # 체결 내역으로 실제 청산 여부 검증 후 처리
+        if not active_syms and len(open_entries) > 0:
+            # 2차 검증: 첫 번째 심볼의 최근 체결 확인
+            _test_sym = open_entries[0]["symbol"]
+            _test_trades = get_recent_trades(_test_sym, limit=5)
+            _entry_time = open_entries[0].get("time", "")
+            _has_close_trade = any(
+                t["realized_pnl"] != 0 and t["time"] >= _entry_time
+                for t in _test_trades
+            )
+            if not _has_close_trade:
+                _log("⚠️ 포지션 API 빈 응답 — 실제 청산 미확인, 스킵", "error")
+                return
         updated = False
         for entry in open_entries:
             sym = entry["symbol"]
             if sym in active_syms:
                 continue  # 아직 포지션 열려있음
-            # 포지션 사라짐 → SL/TP 또는 다른 방법으로 청산됨
+            # 포지션 사라짐 → 체결 내역으로 실제 청산 확인
             trades = get_recent_trades(sym, limit=30)
             entry_time = entry.get("time", "")
             # entry_time 이후 체결된 trade들만 필터링 (심볼별 독립 조회)
@@ -253,6 +546,11 @@ def _check_sl_tp_closed():
                         else trades[-1]["price"] if trades else None)
             _update_journal_pnl(sym, total_rpnl, close_px)
             _log(f"📋 {sym} SL/TP 자동 청산 감지: PnL ${total_rpnl:+.4f}")
+            # 잔존 SL/TP 주문 정리 (SL 체결 → TP 잔존 or 반대)
+            _orphans = get_open_orders(sym)
+            if _orphans:
+                cancel_open_orders(sym)
+                _log(f"🧹 {sym} 잔존 주문 {len(_orphans)}건 정리 완료")
             # 즉시 재분석 큐에 추가
             _q = st.session_state.get("immediate_reanalyze", [])
             if sym not in _q:
@@ -297,26 +595,47 @@ def _update_trailing_stop():
             if atr <= 0:
                 continue
             _mult = st.session_state.get("trailing_atr_mult", 1.0)
-            # 수익이 ATR × 배수 × 수량 이상이면 break-even SL 이동
-            if upnl >= atr * _mult * psize:
-                # break-even: 진입가 ± 0.1% 여유 (수수료 고려)
+            # 프로그레시브 트레일링: 수익 단계별 SL 상향
+            # 1단계: 수익 ≥ ATR×1.0 → BE (진입가)
+            # 2단계: 수익 ≥ ATR×2.0 → 진입가 + ATR×0.5
+            # 3단계: 수익 ≥ ATR×3.0 → 진입가 + ATR×1.0
+            _profit_atr = upnl / (atr * psize) if atr * psize > 0 else 0
+            if _profit_atr >= _mult:  # 최소 1단계 진입
+                # 단계별 SL 계산
+                if _profit_atr >= 3.0:
+                    _sl_offset = atr * 1.0  # 진입가+1ATR 수익 확정
+                elif _profit_atr >= 2.0:
+                    _sl_offset = atr * 0.5  # 진입가+0.5ATR
+                else:
+                    _sl_offset = ep * 0.001  # BE (수수료 여유)
+
                 if side == "LONG":
-                    new_sl = round(ep * 1.001, 2)
+                    new_sl = round(ep + _sl_offset, 2)
                 else:
-                    new_sl = round(ep * 0.999, 2)
-                # 이미 break-even 이상으로 SL이 설정된 경우 스킵
+                    new_sl = round(ep - _sl_offset, 2)
+
+                # 현재 SL보다 더 유리할 때만 이동 (SL은 한 방향으로만)
                 current_sl = open_entry.get("sl")
+                _should_update = True
                 if current_sl:
-                    if side == "LONG" and float(current_sl) >= ep:
-                        continue
-                    if side == "SHORT" and float(current_sl) <= ep:
-                        continue
-                r = update_stop_loss(sym, new_sl, side)
-                if r["success"]:
-                    _log(f"🔄 {sym} 트레일링: SL → break-even ${new_sl:.2f} (수익 ${upnl:+.2f})")
-                    add_log(f"🔄 {sym} SL → break-even ${new_sl:.2f}")
-                else:
-                    _log(f"트레일링 SL 업데이트 실패 {sym}: {r['error']}", "error")
+                    current_sl = float(current_sl)
+                    if side == "LONG" and new_sl <= current_sl:
+                        _should_update = False
+                    elif side == "SHORT" and new_sl >= current_sl:
+                        _should_update = False
+
+                if _should_update:
+                    r = update_stop_loss(sym, new_sl, side)
+                    if r["success"]:
+                        _stage = "3단계" if _profit_atr >= 3.0 else "2단계" if _profit_atr >= 2.0 else "BE"
+                        _log(f"🔄 {sym} 트레일링 {_stage}: SL → ${new_sl:.2f} (수익 {_profit_atr:.1f}ATR)")
+                        add_log(f"🔄 {sym} SL → ${new_sl:.2f} ({_stage}, {_profit_atr:.1f}ATR)")
+                        # 저널에 SL 갱신 반영
+                        open_entry["sl"] = new_sl
+                        open_entry["sl_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        _save_journal(j)
+                    else:
+                        _log(f"트레일링 SL 업데이트 실패 {sym}: {r['error']}", "error")
     except Exception as e:
         _log(f"트레일링 스탑 오류: {e}", "error")
 
@@ -338,17 +657,20 @@ def _check_partial_tp():
             ep   = pos["entry_price"]
             upnl = pos["unrealized_pnl"]
             psize = pos["size"]
-            cur_price = ep + (upnl / psize) if psize > 0 else ep
-
-            # 이미 부분 청산한 포지션은 스킵
-            if st.session_state.get("partial_tp_done", {}).get(sym):
-                continue
+            # 현재가 역산: LONG → ep + (pnl/qty), SHORT → ep - (pnl/qty)
+            if psize > 0:
+                cur_price = ep + (upnl / psize) if side == "LONG" else ep - (upnl / psize)
+            else:
+                cur_price = ep
 
             open_entry = next(
                 (e for e in j if e.get("symbol") == sym and e.get("pnl") is None),
                 None
             )
             if not open_entry:
+                continue
+            # 이미 부분 청산한 포지션 → 저널 기반 확인 (세션 초기화 안전)
+            if open_entry.get("partial_close_qty"):
                 continue
             tp = open_entry.get("tp")
             if not tp:
@@ -364,16 +686,29 @@ def _check_partial_tp():
             # 50% 부분 청산 실행
             r = partial_close_position(sym, close_pct=0.5)
             if r["success"]:
-                _log(f"🎯 {sym} TP 50% 부분 청산 완료 (qty: {r['qty']})")
+                _closed_qty = r["qty"]
+                _remain_qty = round(psize - _closed_qty, 8)
+                _log(f"🎯 {sym} TP 50% 부분 청산 완료 (청산: {_closed_qty}, 잔여: {_remain_qty})")
                 add_log(f"🎯 {sym} TP 도달 → 50% 부분 청산 | 수익 ${upnl:+.2f}")
+                # 저널에 잔여 수량 갱신
+                open_entry["qty"] = _remain_qty
+                open_entry["partial_close_qty"] = _closed_qty
+                open_entry["partial_close_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                _save_journal(j)
                 # 부분 청산 완료 플래그
                 _done = st.session_state.get("partial_tp_done", {})
                 _done[sym] = True
                 st.session_state.partial_tp_done = _done
                 # SL → break-even 이동
                 new_sl = round(ep * 1.001, 2) if side == "LONG" else round(ep * 0.999, 2)
-                update_stop_loss(sym, new_sl, side)
-                add_log(f"🔄 {sym} SL → break-even ${new_sl:.2f}")
+                _sl_r = update_stop_loss(sym, new_sl, side)
+                if _sl_r["success"]:
+                    add_log(f"🔄 {sym} SL → break-even ${new_sl:.2f}")
+                else:
+                    add_log(f"🚨 {sym} 부분 청산 후 SL 업데이트 실패! 수동 확인 필요", "error")
+                    if st.session_state.get("tg_notify"):
+                        send_error(st.session_state.tg_token, st.session_state.tg_chat_id,
+                                   f"🚨 {sym} 부분 청산 후 SL 변경 실패! 수동 확인 필요")
                 if st.session_state.get("tg_notify"):
                     send_error(st.session_state.tg_token, st.session_state.tg_chat_id,
                                f"🎯 {sym} TP 50% 부분 청산 | ${upnl:+.2f}")
@@ -545,15 +880,16 @@ def trader_signal_text(signal: str) -> str:
 def calc_confidence(result: dict) -> tuple:
     """분석 결과에서 신뢰도 점수(0-100)와 방향 반환"""
     score = 10  # 베이스 점수
+    _agree_count = 0  # 방향 동의 지표 카운트 (최소 4개 필요)
 
     tj = result.get("trader_json", {})
     direction = tj.get("signal", "wait")
     if direction == "wait":
         return 30, "wait"
 
-    # 트레이더 JSON confidence를 베이스로 활용 (50% 반영)
+    # 트레이더 JSON confidence를 베이스로 활용
     trader_conf = tj.get("confidence", 50)
-    score = int(trader_conf * 0.4)  # 트레이더 자체 신뢰도 40% 반영 (0.3→0.4 상향)
+    score = int(trader_conf * 0.35)  # 35%로 조정 (지표 자체 점수 비중 확대)
 
     ind    = result.get("indicators", {})    # 15m 지표
     ind_1h = result.get("indicators_1h", {}) # 1h 지표
@@ -562,6 +898,7 @@ def calc_confidence(result: dict) -> tuple:
     cf_type = result.get("confluence_type", "mixed")
     if cf_type == direction:
         score += 25
+        _agree_count += 1
     elif cf_type == "mixed":
         score += 5
     else:
@@ -573,6 +910,7 @@ def calc_confidence(result: dict) -> tuple:
         rl_type = rl.get("type", "wait")
         if rl_type == direction:
             score += 15
+            _agree_count += 1
         elif rl_type == "wait":
             score += 3
         else:
@@ -592,19 +930,19 @@ def calc_confidence(result: dict) -> tuple:
     rsi = ind.get("rsi")
     if rsi:
         if direction == "long" and rsi < 25:
-            score += 12  # 극단 과매도(RSI<25) → 강한 반등 기대 (+12)
+            score += 12; _agree_count += 1  # 극단 과매도 → 강한 반등 기대
         elif direction == "long" and rsi < 40:
-            score += 8   # 과매도 → 반등 기대
+            score += 8; _agree_count += 1   # 과매도 → 반등 기대
         elif direction == "long" and 40 <= rsi <= 60:
             score += 4
         elif direction == "long" and rsi > 70:
             score -= 5   # 과매수에서 롱 → 페널티
         elif direction == "short" and rsi > 60:
-            score += 8   # 과매수 → 하락 기대
+            score += 8; _agree_count += 1   # 과매수 → 하락 기대
         elif direction == "short" and 40 <= rsi <= 60:
             score += 4
         elif direction == "short" and rsi < 25:
-            score -= 8   # 극단 과매도(RSI<25)에서 숏 → 강한 페널티
+            score -= 8   # 극단 과매도에서 숏 → 강한 페널티
         elif direction == "short" and rsi < 30:
             score -= 5   # 과매도에서 숏 → 페널티
 
@@ -612,9 +950,9 @@ def calc_confidence(result: dict) -> tuple:
     macd_hist = ind.get("macd_hist")
     if macd_hist is not None:
         if direction == "long" and macd_hist > 0:
-            score += 10
+            score += 10; _agree_count += 1
         elif direction == "short" and macd_hist < 0:
-            score += 10
+            score += 10; _agree_count += 1
         else:
             score -= 3
 
@@ -624,9 +962,9 @@ def calc_confidence(result: dict) -> tuple:
     price = ind.get("price")
     if ema20 and ema50 and price:
         if direction == "long" and ema20 > ema50 and price > ema20:
-            score += 8   # 골든크로스 + 가격 위
+            score += 8; _agree_count += 1   # 골든크로스 + 가격 위
         elif direction == "short" and ema20 < ema50 and price < ema20:
-            score += 8   # 데드크로스 + 가격 아래
+            score += 8; _agree_count += 1   # 데드크로스 + 가격 아래
         elif direction == "long" and ema20 > ema50:
             score += 4
         elif direction == "short" and ema20 < ema50:
@@ -804,6 +1142,24 @@ def calc_confidence(result: dict) -> tuple:
         elif direction == "short" and _pos_cnt >= 5:
             score += 4   # 롱 과열 지속 → 숏 유리
 
+    # 20. 연속 방향 편향 보정 (±5점) — 한쪽으로 몰리면 페널티
+    _hist = _load_history()
+    if len(_hist) >= 10:
+        _recent = _hist[-20:]
+        _short_cnt = sum(1 for h in _recent if "숏" in h.get("decision", ""))
+        _long_cnt  = sum(1 for h in _recent if "롱" in h.get("decision", ""))
+        _total_sig = _short_cnt + _long_cnt
+        if _total_sig >= 5:
+            if direction == "short" and _short_cnt / _total_sig >= 0.8:
+                score -= 5   # 최근 80%+ 숏 → 숏 편향 페널티
+            elif direction == "long" and _long_cnt / _total_sig >= 0.8:
+                score -= 5   # 최근 80%+ 롱 → 롱 편향 페널티
+
+    # 21. 지표 동의 최소 개수 캡 — 4개 미만 동의 시 70% 상한
+    # 동의 지표: 컨플루언스, RL, RSI, MACD, EMA (5개 중 4+ 필요)
+    if _agree_count < 4:
+        score = min(score, 69)  # 70% 미만으로 캡 → 자동 진입 불가
+
     return max(0, min(100, score)), direction
 
 
@@ -819,7 +1175,7 @@ defaults = {
     "analyzing_symbol": "",
     "tg_token":       TELEGRAM_TOKEN   if BINANCE_READY else "",
     "tg_chat_id":     TELEGRAM_CHAT_ID if BINANCE_READY else "",
-    "tg_notify":      False,
+    "tg_notify":      True,
     "tg_signal_only": True,
     "pnl_baseline":        None,   # 1시간 PNL 기준 잔고
     "pnl_baseline_time":   0,      # 기준 시각 (time.time())
@@ -855,6 +1211,7 @@ defaults = {
     "candle_confirm_on": True,   # 캔들 종가 확인 후 진입 ON/OFF
     "partial_tp_on":    True,    # 부분 청산 (TP 50%) ON/OFF
     "partial_tp_done":  {},      # 이미 부분 청산한 심볼 set {symbol: True}
+    "smart_exit_on":    True,    # 스마트 엑싯 (SL/TP 근접 시 지표 재평가) ON/OFF
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -955,7 +1312,7 @@ def create_chart(df: pd.DataFrame) -> "go.Figure":
 def _load_ppo():
     try:
         from stable_baselines3 import PPO
-        model_path = Path(__file__).parent / "rl/models/v4/ppo_eth_30m.zip"
+        model_path = Path(__file__).parent / "rl/models/v5/ppo_eth_30m.zip"
         if not model_path.exists():
             return None
         return PPO.load(str(model_path))
@@ -964,7 +1321,7 @@ def _load_ppo():
 
 
 def get_rl_signal(symbol: str) -> dict:
-    """ETHUSDT 전용 PPO 모델 신호 반환 (0=관망 1=롱 2=숏 3=청산)"""
+    """ETHUSDT 전용 PPO v5 모델 신호 반환 (0=관망 1=롱 2=숏 3=청산)"""
     if symbol != "ETHUSDT":
         return {"available": False, "reason": "ETH 전용 모델"}
     try:
@@ -975,31 +1332,60 @@ def get_rl_signal(symbol: str) -> dict:
         if model is None:
             return {"available": False, "reason": "모델 파일 없음"}
 
-        # 최근 30m 데이터 70캔들 (v4 모델 학습 타임프레임)
-        df = get_klines("ETHUSDT", "30m", 70)
+        # 최근 30m 데이터 120캔들 (v5: 피처 전처리에 충분한 여유)
+        df = get_klines("ETHUSDT", "30m", 120)
 
-        # 피처 계산 (env._preprocess + data.py 동일 방식)
-        df["price_chg"] = df["close"].pct_change().fillna(0)
-        df["rsi_norm"]  = ta.rsi(df["close"], length=14).fillna(50) / 100.0
-        macd_df = ta.macd(df["close"], fast=12, slow=26, signal=9)
-        df["macd_norm"] = (macd_df["MACD_12_26_9"] / df["close"]).fillna(0)
+        # === v5 피처 13개 계산 (env_v5.py _preprocess 동일) ===
+        df["price_chg"]  = df["close"].pct_change().fillna(0).clip(-0.1, 0.1)
+        df["rsi"]        = ta.rsi(df["close"], length=14).fillna(50)
+        df["rsi_norm"]   = df["rsi"] / 100.0
+        macd_df          = ta.macd(df["close"], fast=12, slow=26, signal=9)
+        df["macd_norm"]  = (macd_df["MACD_12_26_9"] / df["close"]).fillna(0).clip(-0.05, 0.05)
         bb = ta.bbands(df["close"], length=20, std=2)
         col_u = next(c for c in bb.columns if c.startswith("BBU"))
         col_l = next(c for c in bb.columns if c.startswith("BBL"))
-        df["bb_pct"]    = ((df["close"] - bb[col_l]) / (bb[col_u] - bb[col_l])).fillna(0.5).clip(0, 1)
-        ema20 = ta.ema(df["close"], length=20)
-        ema50 = ta.ema(df["close"], length=50)
-        df["ema_ratio"] = (ema20 / ema50 - 1).fillna(0)
-        atr = ta.atr(df["high"], df["low"], df["close"], length=14)
-        df["atr_norm"]  = (atr / df["close"]).fillna(0)
-        df["vol_ratio"] = (df["volume"] / df["volume"].rolling(20).mean()).fillna(1.0).clip(0, 5) / 5.0
+        df["bb_pct"]     = ((df["close"] - bb[col_l]) / (bb[col_u] - bb[col_l])).fillna(0.5).clip(0, 1)
+        ema20            = ta.ema(df["close"], length=20)
+        ema50            = ta.ema(df["close"], length=50)
+        df["ema_ratio"]  = (ema20 / ema50 - 1).fillna(0).clip(-0.1, 0.1)
+        atr              = ta.atr(df["high"], df["low"], df["close"], length=14)
+        df["atr_norm"]   = (atr / df["close"]).fillna(0).clip(0, 0.1)
+        df["vol_ratio"]  = (df["volume"] / df["volume"].rolling(20).mean()).fillna(1.0).clip(0, 5) / 5.0
+        # ADX
+        adx_df = ta.adx(df["high"], df["low"], df["close"], length=14)
+        if adx_df is not None and "ADX_14" in adx_df.columns:
+            df["adx_norm"] = (adx_df["ADX_14"] / 100.0).fillna(0)
+        else:
+            df["adx_norm"] = 0.0
+        # 1시간 변화율 (30m × 2캔들)
+        df["price_chg_1h"] = df["close"].pct_change(2).fillna(0).clip(-0.1, 0.1) / 0.1
+        # RSI 다이버전스
+        price_dir = df["close"].diff(5).apply(lambda x: 1 if x > 0 else -1)
+        rsi_dir   = df["rsi"].diff(5).apply(lambda x: 1 if x > 0 else -1)
+        df["rsi_diverge"] = (price_dir != rsi_dir).astype(float)
+        # Stochastic RSI
+        stoch = ta.stochrsi(df["close"], length=14, rsi_length=14, k=3, d=3)
+        if stoch is not None and "STOCHRSIk_14_14_3_3" in stoch.columns:
+            df["stoch_rsi"] = (stoch["STOCHRSIk_14_14_3_3"] / 100.0).fillna(0.5).clip(0, 1)
+        else:
+            df["stoch_rsi"] = 0.5
+        # OBV 기울기
+        obv = (df["volume"] * np.where(df["close"].diff() > 0, 1, -1)).cumsum()
+        obv_std = obv.rolling(20).std().replace(0, np.nan).fillna(1)
+        df["obv_slope"] = (obv.diff(5) / obv_std).fillna(0).clip(-3, 3) / 3.0
+        # 변동성 레짐
+        df["vol_regime"] = atr.rolling(100).rank(pct=True).fillna(0.5)
 
         df = df.dropna().reset_index(drop=True)
         if len(df) < 20:
             return {"available": False, "reason": "데이터 부족"}
 
-        # obs 구성: 마지막 20캔들, 포지션 없음 상태
-        feat_cols = ["price_chg", "rsi_norm", "macd_norm", "bb_pct", "ema_ratio", "atr_norm", "vol_ratio"]
+        # obs 구성: 마지막 20캔들, v5 피처 13개 + 상태 4개 = 17차원 × 20 = 340
+        feat_cols = [
+            "price_chg", "rsi_norm", "macd_norm", "bb_pct", "ema_ratio",
+            "atr_norm", "vol_ratio", "adx_norm", "price_chg_1h", "rsi_diverge",
+            "stoch_rsi", "obv_slope", "vol_regime",
+        ]
         rows = []
         for i in range(len(df) - 20, len(df)):
             row = [float(df[c].iloc[i]) for c in feat_cols]
@@ -1121,13 +1507,13 @@ def _should_trade(auto_run: bool, confidence: int = 0) -> bool:
     now_min = datetime.now().minute
     now_sec = datetime.now().second
     is_scheduled     = now_min in (0, 30)    # 정각 or 30분
-    is_strong_signal = confidence >= 65      # 강한 신호
+    is_strong_signal = confidence >= 70      # 강한 신호 (65→70 상향)
     if not (is_scheduled or is_strong_signal):
         return False
     # 캔들 종가 확인 모드: 15m 캔들 경계(0,15,30,45분) 후 3분 이내만 진입
     if st.session_state.get("candle_confirm_on", True):
-        _boundaries = [0, 15, 30, 45]
-        _dist = min(abs(now_min - b) for b in _boundaries)
+        _boundaries = [0, 15, 30, 45, 60]  # 60 추가 (wraparound: 59분→0분 = 1분)
+        _dist = min(min(abs(now_min - b), 60 - abs(now_min - b)) for b in _boundaries)
         # 경계에서 3분 초과 시 진입 보류 (가짜 돌파 방지)
         if _dist > 3:
             return False
@@ -1136,11 +1522,6 @@ def _should_trade(auto_run: bool, confidence: int = 0) -> bool:
 
 def run_analysis(symbol: str, execute_trade: bool = False):
     add_log(f"🔍 {symbol} 분석 시작 (15m + 1h)...")
-    if st.session_state.get("tg_notify"):
-        _start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        send_progress(st.session_state.tg_token, st.session_state.tg_chat_id,
-                      symbol, "🔍 분석 시작", f"📅 {_start_time}",
-                      is_start=True)
 
     # 에이전트 상태 초기화
     for k in st.session_state.agent_status:
@@ -1381,6 +1762,7 @@ def run_analysis(symbol: str, execute_trade: bool = False):
         "confluence": result.get("confluence", ""),
         "rl_label":   result.get("rl", {}).get("label", "") if result.get("rl", {}).get("available") else "",
         "trader_conf": tj.get("confidence", 0),
+        "confidence": confidence,  # 최종 신뢰도 (calc_confidence + 교차 필터)
     }
     st.session_state.analysis_history.insert(0, history_entry)
     if len(st.session_state.analysis_history) > 100:
@@ -1390,20 +1772,9 @@ def run_analysis(symbol: str, execute_trade: bool = False):
     # ── 파일 캐시 저장 ──
     _save_analysis(st.session_state.last_analysis)
 
-    # ── 텔레그램: 트레이더 결정 카드 전송 (신호 변경 시에만) ──
-    if st.session_state.get("tg_notify"):
-        _cur_signal  = tj.get("signal", "wait")
-        _prev_signal = st.session_state.last_tg_signal.get(symbol, "")
-        if _cur_signal != _prev_signal:
-            _rl_label = result.get("rl", {}).get("label", "") if result.get("rl", {}).get("available") else ""
-            send_trader_decision(
-                st.session_state.tg_token, st.session_state.tg_chat_id,
-                symbol, tj, confidence=confidence, rl_label=_rl_label
-            )
-            st.session_state.last_tg_signal[symbol] = _cur_signal
-            add_log(f"📲 텔레그램 전송: {_cur_signal} (이전: {_prev_signal or '없음'})")
-        else:
-            add_log(f"📵 텔레그램 스킵: 신호 동일 ({_cur_signal})")
+    # ── 텔레그램: 신호 변경 추적 (알림은 진입/청산 시에만 발송) ──
+    _cur_signal  = tj.get("signal", "wait")
+    st.session_state.last_tg_signal[symbol] = _cur_signal
 
     # ── 조기 청산 체크 (반대 신호 + 손실 중) ──
     if BINANCE_READY and st.session_state.get("early_exit_on", True) and st.session_state.get("auto_run"):
@@ -1417,15 +1788,17 @@ def run_analysis(symbol: str, execute_trade: bool = False):
                 _exit_thr = st.session_state.get("early_exit_conf", 70)
                 _is_opp   = (_pos_side == "LONG"  and _new_sig == "short") or \
                             (_pos_side == "SHORT" and _new_sig == "long")
-                if _is_opp and confidence >= _exit_thr and _upnl < 0:
-                    add_log(f"🚨 조기 청산: {symbol} {_pos_side} | 반대신호({_new_sig}, {confidence}%) | PnL ${_upnl:.2f}")
+                # 반대 신호 + 높은 신뢰도 → 손익 무관하게 청산 (수익 중이면 이익 확정)
+                if _is_opp and confidence >= _exit_thr:
+                    _pnl_label = "손실" if _upnl < 0 else "이익확정"
+                    add_log(f"🚨 조기 청산({_pnl_label}): {symbol} {_pos_side} | 반대신호({_new_sig}, {confidence}%) | PnL ${_upnl:.2f}")
                     _cr = close_position(symbol)
                     if _cr["success"]:
                         _update_journal_pnl(symbol, _upnl, ind.get("price"))
                         add_log(f"✅ 조기 청산 완료: {symbol} PnL ${_upnl:.2f}")
                         if st.session_state.get("tg_notify"):
                             send_error(st.session_state.tg_token, st.session_state.tg_chat_id,
-                                       f"🚨 {symbol} 조기 청산 | 반대신호 {confidence}% | PnL ${_upnl:.2f}")
+                                       f"🚨 {symbol} 조기 청산({_pnl_label}) | 반대신호 {confidence}% | PnL ${_upnl:.2f}")
                     else:
                         add_log(f"❌ 조기 청산 실패: {_cr.get('error', '')}", "error")
         except Exception as _e:
@@ -1446,16 +1819,21 @@ def run_analysis(symbol: str, execute_trade: bool = False):
             if st.session_state.daily_start_date != _today or st.session_state.daily_start_balance is None:
                 st.session_state.daily_start_date    = _today
                 st.session_state.daily_start_balance = _bal_now["total"]
+            # 실현 손실 + 미실현 손실 합산 (미실현 PnL이 음수면 위험 반영)
+            _unrealized = _bal_now.get("unrealized_pnl", 0)
             _daily_loss = st.session_state.daily_start_balance - _bal_now["total"]
-            if _daily_loss >= MAX_DAILY_LOSS:
-                add_log(f"🚨 일일 손실 한도 초과 (${_daily_loss:.2f}) — 거래 중단")
+            _daily_loss_total = _daily_loss + max(0, -_unrealized)  # 미실현 손실만 합산
+            if _daily_loss_total >= MAX_DAILY_LOSS:
+                add_log(f"🚨 일일 손실 한도 초과 (실현${_daily_loss:.2f} + 미실현${max(0,-_unrealized):.2f} = ${_daily_loss_total:.2f}) — 거래 중단")
                 st.session_state.trading_paused = True
                 if st.session_state.get("tg_notify"):
                     send_daily_limit_alert(st.session_state.tg_token, st.session_state.tg_chat_id,
-                                           _daily_loss, MAX_DAILY_LOSS)
+                                           _daily_loss_total, MAX_DAILY_LOSS)
                 execute_trade = False
-        except Exception:
-            pass
+        except Exception as e:
+            # 잔고 조회 실패 시 안전하게 거래 차단 (한도 우회 방지)
+            add_log(f"⚠️ 일일 손실 체크 실패: {e} — 안전을 위해 거래 보류", "error")
+            execute_trade = False
 
     if execute_trade:
         # 연속 손실 쿨다운 체크
@@ -1525,37 +1903,81 @@ def run_analysis(symbol: str, execute_trade: bool = False):
         _price  = ind.get("price", 0) or 0
 
         # SL/TP: trader JSON 우선, 없으면 ATR 폴백 (ADX 동적 R:R)
+        # 최소 SL 거리: 가격의 1.5% (15m 크립토 노이즈 대비)
+        _MIN_SL_PCT = 0.015
+
+        def _enforce_min_sl(side: str, sl_val, price_val):
+            """최소 SL 거리 보장"""
+            if not sl_val or not price_val:
+                return sl_val
+            _min_dist = price_val * _MIN_SL_PCT
+            if side == "BUY" and price_val - sl_val < _min_dist:
+                sl_val = round(price_val - _min_dist, 2)
+                add_log(f"⚠️ SL 최소거리 보정: ${sl_val} (≥{_MIN_SL_PCT*100}%)")
+            elif side == "SELL" and sl_val - price_val < _min_dist:
+                sl_val = round(price_val + _min_dist, 2)
+                add_log(f"⚠️ SL 최소거리 보정: ${sl_val} (≥{_MIN_SL_PCT*100}%)")
+            return sl_val
+
         def _resolve_sl_tp(side: str):
+            """반환: (soft_sl, tp, hard_sl, sl_mode)
+            - sl_mode="soft": 박스권 — 캔들 종가 확인 후 청산, hard_sl은 급락 안전망
+            - sl_mode="hard": 추세 — STOP_MARKET 즉시 청산
+            """
+            _adx = ind.get("adx", 0) or 0
+            _is_ranging = _adx < 20
+
             sl = tj.get("sl")
             tp = tj.get("tp")
             if sl and tp:
+                sl = _enforce_min_sl(side, sl, _price)
+                if _is_ranging:
+                    # 트레이더 JSON SL = 소프트 SL, 하드 SL = 2배 거리
+                    _dist = abs(_price - sl)
+                    hard_sl = round(sl - _dist, 2) if side == "BUY" else round(sl + _dist, 2)
+                    add_log(f"📐 트레이더 JSON 소프트SL:${sl} / 하드SL:${hard_sl} / TP:${tp} (박스권)")
+                    return sl, tp, hard_sl, "soft"
                 add_log(f"📐 트레이더 JSON SL:${sl} / TP:${tp}")
-                return sl, tp
-            # ADX 기반 R:R 동적 조정
-            _adx = ind.get("adx", 0) or 0
+                return sl, tp, sl, "hard"
+
+            # ADX 기반 R:R 동적 조정 (SL은 항상 유지, TP만 조정)
             if _adx >= 30:
-                # 강한 추세: TP 확대 (×4.0), SL 유지
                 _sl_mult = ATR_SL_MULT
-                _tp_mult = ATR_TP_MULT * 1.33  # 3.0→4.0
+                _tp_mult = ATR_TP_MULT * 1.25  # 4.0→5.0
                 add_log(f"📈 강한 추세(ADX={_adx:.0f}): TP 확대 ×{_tp_mult:.1f}")
-            elif _adx < 20:
-                # 횡보: TP·SL 모두 축소
-                _sl_mult = ATR_SL_MULT * 0.67  # 1.5→1.0
-                _tp_mult = ATR_TP_MULT * 0.67  # 3.0→2.0
-                add_log(f"↔️ 횡보(ADX={_adx:.0f}): SL/TP 축소 ×{_tp_mult:.1f}")
+            elif _is_ranging:
+                _sl_mult = ATR_SL_MULT
+                _tp_mult = ATR_TP_MULT * 0.625  # 4.0→2.5
+                add_log(f"↔️ 횡보(ADX={_adx:.0f}): 소프트 SL 모드, TP 축소 ×{_tp_mult:.1f}")
             else:
                 _sl_mult = ATR_SL_MULT
                 _tp_mult = ATR_TP_MULT
             dist_sl = _atr * _sl_mult
             dist_tp = _atr * _tp_mult
+            # 최소 SL 거리 보장
+            _min_sl_dist = _price * _MIN_SL_PCT
+            if dist_sl < _min_sl_dist:
+                add_log(f"⚠️ ATR SL({dist_sl:.2f}) < 최소 1.5%({_min_sl_dist:.2f}) → 보정")
+                dist_sl = _min_sl_dist
             if side == "BUY":
                 sl = round(_price - dist_sl, 2) if dist_sl else None
                 tp = round(_price + dist_tp, 2) if dist_tp else None
             else:
                 sl = round(_price + dist_sl, 2) if dist_sl else None
                 tp = round(_price - dist_tp, 2) if dist_tp else None
+
+            if _is_ranging and sl:
+                # 박스권: 소프트 SL(캔들 종가), 하드 SL(급락 안전망 = 2배 거리)
+                hard_dist = dist_sl * 2
+                if side == "BUY":
+                    hard_sl = round(_price - hard_dist, 2)
+                else:
+                    hard_sl = round(_price + hard_dist, 2)
+                add_log(f"📐 소프트SL:${sl} / 하드SL:${hard_sl} / TP:${tp} (R:R 1:{_tp_mult/_sl_mult:.1f})")
+                return sl, tp, hard_sl, "soft"
+
             add_log(f"📐 ATR폴백 SL:${sl} / TP:${tp} (R:R 1:{_tp_mult/_sl_mult:.1f})")
-            return sl, tp
+            return sl, tp, sl, "hard"
 
         # 진입 금액: 신뢰도 비례 배율 적용 후 MAX_USDT 상한
         # 65-69% → ×0.5 / 70-79% → ×0.75 / 80%+ → ×1.0
@@ -1576,37 +1998,65 @@ def run_analysis(symbol: str, execute_trade: bool = False):
         add_log(f"💼 진입 금액: ${_order_usdt} (잔고 {st.session_state.get('position_pct', 20)}% × 신뢰도배율 {_conf_mult:.0%})")
 
         _use_lmt = st.session_state.get("limit_order_on", False)
+        # 진입 전 잔존 주문 정리 (이전 SL/TP 잔존 방지)
+        _old_orders = get_open_orders(symbol)
+        if _old_orders:
+            cancel_open_orders(symbol)
+            add_log(f"🧹 {symbol} 기존 잔존 주문 {len(_old_orders)}건 정리")
         if _signal == "long":
-            _sl, _tp = _resolve_sl_tp("BUY")
-            r = place_order(symbol, "BUY", _order_usdt, LEVERAGE, sl_price=_sl, tp_price=_tp, use_limit=_use_lmt)
+            _sl, _tp, _hard_sl, _sl_mode = _resolve_sl_tp("BUY")
+            # 소프트 모드: 바이낸스에는 하드 SL(안전망)만 배치
+            _actual_sl = _hard_sl if _sl_mode == "soft" else _sl
+            r = place_order(symbol, "BUY", _order_usdt, LEVERAGE, sl_price=_actual_sl, tp_price=_tp, use_limit=_use_lmt)
             if r["success"]:
-                add_log(f"✅ 롱 주문 실행: {symbol} {r['qty']} @ ${r['price']}")
+                _mode_label = " [소프트SL]" if _sl_mode == "soft" else ""
+                add_log(f"✅ 롱 주문 실행: {symbol} {r['qty']} @ ${r['price']}{_mode_label}")
+                # SL/TP 배치 실패 경고
+                if not r.get("sl_placed") and _actual_sl:
+                    add_log(f"🚨 SL 주문 미배치! {symbol} — 수동 확인 필요", "error")
+                if not r.get("tp_placed") and _tp:
+                    add_log(f"⚠️ TP 주문 미배치 {symbol}", "error")
                 if st.session_state.get("tg_notify"):
                     send_order(st.session_state.tg_token, st.session_state.tg_chat_id,
                                symbol, "BUY", r["qty"], r["price"])
+                    if not r.get("sl_placed") and _actual_sl:
+                        send_error(st.session_state.tg_token, st.session_state.tg_chat_id,
+                                   f"🚨 {symbol} SL 주문 미배치! 수동 확인 필요")
                 _add_journal_entry({
                     "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "symbol": symbol, "side": "🟢 롱", "action": "진입",
                     "qty": r["qty"], "price": r["price"],
                     "sl": _sl, "tp": _tp, "atr": _atr, "pnl": None,
                     "confidence": confidence,
+                    "sl_mode": _sl_mode, "hard_sl": _hard_sl,
                 })
             else:
                 add_log(f"❌ 주문 실패: {r['error']}", "error")
         elif _signal == "short":
-            _sl, _tp = _resolve_sl_tp("SELL")
-            r = place_order(symbol, "SELL", _order_usdt, LEVERAGE, sl_price=_sl, tp_price=_tp, use_limit=_use_lmt)
+            _sl, _tp, _hard_sl, _sl_mode = _resolve_sl_tp("SELL")
+            _actual_sl = _hard_sl if _sl_mode == "soft" else _sl
+            r = place_order(symbol, "SELL", _order_usdt, LEVERAGE, sl_price=_actual_sl, tp_price=_tp, use_limit=_use_lmt)
             if r["success"]:
-                add_log(f"✅ 숏 주문 실행: {symbol} {r['qty']} @ ${r['price']}")
+                _mode_label = " [소프트SL]" if _sl_mode == "soft" else ""
+                add_log(f"✅ 숏 주문 실행: {symbol} {r['qty']} @ ${r['price']}{_mode_label}")
+                # SL/TP 배치 실패 경고
+                if not r.get("sl_placed") and _actual_sl:
+                    add_log(f"🚨 SL 주문 미배치! {symbol} — 수동 확인 필요", "error")
+                if not r.get("tp_placed") and _tp:
+                    add_log(f"⚠️ TP 주문 미배치 {symbol}", "error")
                 if st.session_state.get("tg_notify"):
                     send_order(st.session_state.tg_token, st.session_state.tg_chat_id,
                                symbol, "SELL", r["qty"], r["price"])
+                    if not r.get("sl_placed") and _actual_sl:
+                        send_error(st.session_state.tg_token, st.session_state.tg_chat_id,
+                                   f"🚨 {symbol} SL 주문 미배치! 수동 확인 필요")
                 _add_journal_entry({
                     "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "symbol": symbol, "side": "🔴 숏", "action": "진입",
                     "qty": r["qty"], "price": r["price"],
                     "sl": _sl, "tp": _tp, "atr": _atr, "pnl": None,
                     "confidence": confidence,
+                    "sl_mode": _sl_mode, "hard_sl": _hard_sl,
                 })
             else:
                 add_log(f"❌ 주문 실패: {r['error']}", "error")
@@ -1769,11 +2219,13 @@ with st.sidebar:
         try:
             _bal_cur  = get_balance()
             _dloss    = st.session_state.daily_start_balance - _bal_cur["total"]
-            _dloss_pct = (_dloss / MAX_DAILY_LOSS * 100) if MAX_DAILY_LOSS else 0
-            _d_color   = "#e53935" if _dloss > MAX_DAILY_LOSS * 0.7 else "#555"
+            _dunreal  = _bal_cur.get("unrealized_pnl", 0)
+            _dloss_total = _dloss + max(0, -_dunreal)
+            _dloss_pct = (_dloss_total / MAX_DAILY_LOSS * 100) if MAX_DAILY_LOSS else 0
+            _d_color   = "#e53935" if _dloss_total > MAX_DAILY_LOSS * 0.7 else "#555"
             st.markdown(
                 f"<div style='font-size:12px; color:{_d_color}; margin-top:4px;'>"
-                f"📉 오늘 손실: ${_dloss:+.2f} / ${MAX_DAILY_LOSS:.0f} "
+                f"📉 오늘 손실: ${_dloss_total:+.2f} / ${MAX_DAILY_LOSS:.0f} "
                 f"({_dloss_pct:.0f}%)</div>",
                 unsafe_allow_html=True
             )
@@ -1959,8 +2411,8 @@ with st.sidebar:
         st.caption("📁 config.py 경로: /Users/sunny/Desktop/ai-lab/trading/config.py")
 
 
-# ── 실시간 메트릭 + 포지션 (1초 갱신) ────────────────────────────────
-@st.fragment(run_every=1)
+# ── 실시간 메트릭 + 포지션 (5초 갱신 — rate limit 보호) ──────────────
+@st.fragment(run_every=5)
 def live_panel(sym: str):
     try:
         price     = get_price(sym)
@@ -2281,7 +2733,7 @@ with tab_bt:
     }
     _bt_col1, _bt_col2, _bt_col3 = st.columns([1, 1, 2])
     with _bt_col1:
-        _bt_version = st.selectbox("모델 버전", list(_BT_INTERVALS.keys()), index=3, key="bt_version")
+        _bt_version = st.selectbox("모델 버전", list(_BT_INTERVALS.keys()), index=4, key="bt_version")
     with _bt_col2:
         _bt_interval = st.selectbox("인터벌", _BT_INTERVALS[_bt_version], key="bt_interval")
     with _bt_col3:
@@ -2912,9 +3364,11 @@ if auto_interval != "비활성":
     secs    = interval_map[auto_interval]
     elapsed = time.time() - st.session_state.last_auto_time
     if elapsed >= secs:
-        # SL/TP 자동 청산 감지 + 트레일링 스탑 + 부분 청산 체크 (분석 전 먼저)
+        # SL/TP 자동 청산 감지 + 소프트SL + 트레일링 스탑 + 부분 청산 체크 (분석 전 먼저)
         if BINANCE_READY:
             _check_sl_tp_closed()
+            _check_soft_sl()
+            _smart_exit_check()
             _update_trailing_stop()
             _check_partial_tp()
         for _sym in SYMBOLS:
@@ -2930,9 +3384,11 @@ def _auto_countdown():
     ai = st.session_state.get("auto_interval_select", "비활성")
     if ai == "비활성":
         return
-    # ── 30초마다 SL/TP 청산 감지 + 부분 청산 체크 + 즉시 재분석 트리거 ──
+    # ── 30초마다 SL/TP 청산 감지 + 소프트SL + 부분 청산 체크 + 즉시 재분석 트리거 ──
     if BINANCE_READY:
         _check_sl_tp_closed()
+        _check_soft_sl()
+        _smart_exit_check()
         _check_partial_tp()
         if st.session_state.get("immediate_reanalyze"):
             st.rerun(scope="app")  # 즉시 앱 재실행 → 메인 루프에서 재분석

@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 _CMD_FILE = Path(__file__).parent / "tg_commands.json"
+_cmd_lock = threading.Lock()
 
 
 def _send(token: str, chat_id: str, text: str, parse_mode: str = "HTML") -> bool:
@@ -226,15 +227,16 @@ def send_daily_limit_alert(token: str, chat_id: str, loss: float, limit: float) 
 
 # ── 텔레그램 명령어 폴링 ─────────────────────────────────────────────
 def _write_command(cmd: dict):
-    """명령어를 파일에 큐잉"""
-    try:
-        cmds = []
-        if _CMD_FILE.exists():
-            cmds = json.loads(_CMD_FILE.read_text())
-        cmds.append(cmd)
-        _CMD_FILE.write_text(json.dumps(cmds))
-    except Exception:
-        pass
+    """명령어를 파일에 큐잉 (스레드 안전)"""
+    with _cmd_lock:
+        try:
+            cmds = []
+            if _CMD_FILE.exists():
+                cmds = json.loads(_CMD_FILE.read_text())
+            cmds.append(cmd)
+            _CMD_FILE.write_text(json.dumps(cmds))
+        except Exception:
+            pass
 
 
 def poll_commands(token: str, chat_id: str):
@@ -272,7 +274,10 @@ def poll_commands(token: str, chat_id: str):
                     _send(token, chat_id, "▶️ <b>자동 거래 재개됨</b>")
                 elif text.startswith("/close"):
                     parts = text.split()
-                    sym = parts[1].upper() if len(parts) > 1 else "ETHUSDT"
+                    if len(parts) < 2:
+                        _send(token, chat_id, "⚠️ 심볼을 지정하세요: /close ETHUSDT")
+                        continue
+                    sym = parts[1].upper()
                     _write_command({"cmd": "close", "symbol": sym})
                     _send(token, chat_id, f"🔵 <b>{sym} 청산 명령 접수됨</b>")
                 elif text == "/help":
@@ -283,8 +288,8 @@ def poll_commands(token: str, chat_id: str):
                         "/resume — 자동 거래 재개\n"
                         "/close ETHUSDT — 포지션 청산"
                     )
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"⚠️ 텔레그램 폴링 오류: {e}")
         time.sleep(3)
 
 
@@ -296,12 +301,13 @@ def start_polling_thread(token: str, chat_id: str) -> threading.Thread:
 
 
 def read_and_clear_commands() -> list:
-    """명령어 파일 읽고 비우기"""
-    try:
-        if not _CMD_FILE.exists():
+    """명령어 파일 읽고 비우기 (스레드 안전)"""
+    with _cmd_lock:
+        try:
+            if not _CMD_FILE.exists():
+                return []
+            cmds = json.loads(_CMD_FILE.read_text())
+            _CMD_FILE.write_text("[]")
+            return cmds
+        except Exception:
             return []
-        cmds = json.loads(_CMD_FILE.read_text())
-        _CMD_FILE.write_text("[]")
-        return cmds
-    except Exception:
-        return []

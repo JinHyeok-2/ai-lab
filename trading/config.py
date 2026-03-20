@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 # 바이낸스 선물거래 봇 설정
 
-# ── API 키 ──────────────────────────────────────────────────────────
-API_KEY    = "IZABohzjh1kDy66OFjCbQtzguaimEGXhTFT37wWY358vGxhznGeFO8Obg29VY7xT"
-API_SECRET = "vnxPbEVGXpjkxUB5ZG9D4RBDMGvDMr7bqErVjtvShKV9OYxfIBSZDGtJM1z8lQ7C"
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ── API 키 (환경변수에서 로드) ─────────────────────────────────────────
+API_KEY    = os.getenv("BINANCE_API_KEY", "")
+API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 
 # ── 테스트넷 여부 ────────────────────────────────────────────────────
 # True  → 테스트넷 (가상 자금, 안전)
@@ -14,8 +19,8 @@ TESTNET = True
 SYMBOLS    = ["ETHUSDT", "BTCUSDT"]   # 감시할 코인 (ETH 기본)
 LEVERAGE   = 3                         # 레버리지 배수
 MAX_USDT       = 100                   # 1회 최대 진입 금액 (USDT)
-ATR_SL_MULT    = 1.5                   # 손절 = ATR × 1.5
-ATR_TP_MULT    = 3.0                   # 익절 = ATR × 3.0  (R:R 1:2)
+ATR_SL_MULT    = 2.0                   # 손절 = ATR × 2.0 (노이즈 대비 상향)
+ATR_TP_MULT    = 4.0                   # 익절 = ATR × 4.0  (R:R 1:2 유지)
 MAX_DAILY_LOSS = 200                   # 일일 최대 손실 한도 (USDT) — 초과 시 거래 중단
 
 # ── 분석 설정 ────────────────────────────────────────────────────────
@@ -39,8 +44,6 @@ NEWS_MODEL    = "sonnet"
 RISK_MODEL    = "sonnet"
 TRADER_MODEL  = "sonnet"
 
-# ── 텔레그램 알림 ────────────────────────────────────────────────────
-# @BotFather 에서 봇 생성 후 토큰 발급
-# Chat ID: @userinfobot 에 /start 보내면 확인 가능
-TELEGRAM_TOKEN   = "8690641013:AAEKBcZbMA4Kl-HLXO_5Zh1cLfk3k31l-W4"
-TELEGRAM_CHAT_ID = "1765732154"
+# ── 텔레그램 알림 (환경변수에서 로드) ──────────────────────────────────
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")

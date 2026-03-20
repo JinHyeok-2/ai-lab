@@ -67,8 +67,8 @@ def get_alt_futures_symbols(limit: int = 50) -> list:
 def _score_symbol(sym: str) -> dict | None:
     """단일 심볼 스크리닝 — 점수 계산 후 결과 반환 (실패 시 None)"""
     try:
-        klines_15m = get_klines(sym, "15m", 30)
-        klines_1h  = get_klines(sym, "1h",  24)
+        klines_15m = get_klines(sym, "15m", 60)   # EMA50 계산에 최소 50개 필요
+        klines_1h  = get_klines(sym, "1h",  60)   # 1h도 EMA50용 충분한 캔들
 
         ind_15m = calc_indicators(klines_15m)
         ind_1h  = calc_indicators(klines_1h)
@@ -262,10 +262,10 @@ def check_binance_announcements() -> dict:
             resp = requests.get(url, headers=_ANN_HEADERS, timeout=8)
             resp.raise_for_status()
             data = resp.json()
-            articles = (
-                data.get("data", {}).get("articles", [])
-                or data.get("data", {}).get("catalogs", [{}])[0].get("articles", [])
-            )
+            articles = data.get("data", {}).get("articles", [])
+            if not articles:
+                _cats = data.get("data", {}).get("catalogs", [])
+                articles = _cats[0].get("articles", []) if _cats else []
             for art in articles:
                 art_id    = str(art.get("id", ""))
                 art_title = art.get("title", "")

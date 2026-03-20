@@ -3,3 +3,13 @@ __pycache__/
 .DS_Store
 docs/report_*.md
 .env
+
+# trading 런타임 파일
+trading/logs/
+trading/trading.log
+trading/analysis_history.json
+trading/last_analysis.json
+trading/last_announcement.json
+trading/trade_journal.json
+trading/rl/train_v5.log
+trading/rl/models/v5_old/
