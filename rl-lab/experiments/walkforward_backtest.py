@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
+import sys; sys.stdout.reconfigure(line_buffering=True)
 # Walk-forward 검증: 테스트 기간을 2개월 단위로 분할하여 구간별 성능 측정
 # exp14 단일 + 앙상블(exp14+exp08+exp05)의 과적합 여부 확인
 
-import sys
 from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))

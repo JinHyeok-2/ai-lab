@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
+import sys; sys.stdout.reconfigure(line_buffering=True)
 # BTC 앙상블 조합 탐색 — 4모델(btc_exp14, seed100, seed200, seed300)
 # 3모델 다수결/만장일치 + 4모델 다수결/가중투표
 
-import sys
 from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))

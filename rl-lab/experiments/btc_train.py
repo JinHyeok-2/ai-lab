@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
+import sys; sys.stdout.reconfigure(line_buffering=True)
 # BTC 30m PPO 학습 — exp14 설정 기반 (gamma=0.975)
 # ETH 환경(env_v51_exp02) 재사용, BTC 데이터
 
-import sys
 from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))

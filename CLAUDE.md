@@ -143,10 +143,15 @@
 | 71 | 데이터 자동 갱신 크론 — 매일 01:03 ETH+BTC 캔들 다운로드 |
 | 72 | 모델 정리 — 94MB→27MB, 불필요 19개 삭제, 8개 보존 |
 
-### 미완료
-| # | 항목 | 상태 | 비고 |
-|---|------|------|------|
-| 70 | BTC RL 모델 학습 | 🔄 진행 중 | GPU ~2시간 |
+### 2026-03-24 (BTC RL 완성 + git 초기화)
+| # | 항목 |
+|---|------|
+| 76 | BTC RL 프로덕션 통합 — get_rl_signal() ETH/BTC 양쪽 지원, 다수결 투표 |
+| 77 | 야간 배치 학습 — BTC seed100/200/300 + ETH seed800, 4모델 완료 |
+| 78 | BTC 앙상블 탐색 — 14개 조합, exp14+seed100+seed200 다수결 최적 (MDD 0%, 승률 100%) |
+| 79 | BTC WF 검증 — 4/4 구간 전승, MDD 0%, 승률 100% |
+| 80 | ETH seed800 재탐색 — 기존 프로덕션(exp14+exp08+seed700) 유지 결론 |
+| 81 | git 초기화 + 첫 커밋 — .gitignore, 60파일, GitHub private repo 연결 |
 
 ## 핵심 안전장치
 
@@ -159,6 +164,12 @@
 - 변동성 레짐: ADX<15 횡보→최소 신뢰도 75%, ADX≥30 추세→60%
 - 포트폴리오 한도: 메인 총 익스포저 $60 이하
 - 고신뢰도(80+) 과신뢰 방지: 데이터 5건 미만 시 70% 캡
+
+## RL 스크립트 규칙
+
+- 모든 Python 스크립트 shebang 다음 줄에 `import sys; sys.stdout.reconfigure(line_buffering=True)` 추가
+- 백그라운드 실행 시 `run_in_background` 사용 → 완료 알림 대기 (TaskOutput 폴링 금지)
+- conda run 실행: `conda run -n ai-lab python <script>`
 
 ## 작업 규칙
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
+import sys; sys.stdout.reconfigure(line_buffering=True)
 # ETH 앙상블 재탐색: eth_seed800 포함 시 성능 변화 확인
 # 기존 최적: exp14+exp08+seed700 만장일치 (+1490%, MDD -3.1%, 94.6%)
 
-import sys
 from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
+import sys; sys.stdout.reconfigure(line_buffering=True)
 # 야간 GPU 병렬 학습 배치 — BTC 시드 3종 + ETH 시드 1종
 # 동시 4개 GPU 학습 (각 ~300MB VRAM, 총 ~1.2GB / 24GB)
 
-import sys
 from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))

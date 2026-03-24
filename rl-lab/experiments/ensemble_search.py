@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
+import sys; sys.stdout.reconfigure(line_buffering=True)
 # 앙상블 조합 탐색: 다양한 모델 조합 + 투표 전략 비교
 # 후보: exp14, exp08, exp05(LSTM), exp13, exp15, seed600, seed700
 
-import sys
 from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))

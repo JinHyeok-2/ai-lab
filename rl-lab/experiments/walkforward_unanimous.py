@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
+import sys; sys.stdout.reconfigure(line_buffering=True)
 # Walk-forward 검증: exp14+exp08+seed700 만장일치 (새 프로덕션 앙상블)
 
-import sys
 from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
