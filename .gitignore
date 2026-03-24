@@ -1,0 +1,25 @@
+# 환경/시크릿
+.env
+*.env
+__pycache__/
+*.pyc
+
+# 데이터 (대용량)
+rl/*.csv
+rl-lab/data/
+*.db
+
+# 모델 바이너리
+rl-lab/models/*/*.zip
+rl/models/
+
+# 로그/임시
+*.log
+*.png
+reports/
+nohup.out
+
+# 시스템
+.DS_Store
+*.swp
+*.swo
