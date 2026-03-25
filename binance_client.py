@@ -372,7 +372,7 @@ def place_limit_order(symbol: str, side: str, usdt_amount: float,
 
 def place_sl_tp(symbol: str, side: str, qty: float,
                 sl_price: float = None, tp_price: float = None) -> dict:
-    """체결된 포지션에 SL/TP 배치 (LIMIT 체결 확인 후 호출)"""
+    """체결된 포지션에 SL/TP 배치 (STOP/TAKE_PROFIT LIMIT — 일반 주문으로 관리)"""
     client = get_client()
     _, tick_size = _get_symbol_filters(symbol)
     sl_side = "SELL" if side == "BUY" else "BUY"
@@ -383,8 +383,9 @@ def place_sl_tp(symbol: str, side: str, qty: float,
         for _try in range(2):
             try:
                 _sl_resp = client.futures_create_order(
-                    symbol=symbol, side=sl_side, type="STOP_MARKET",
-                    stopPrice=sl_rounded, quantity=qty, reduceOnly=True,
+                    symbol=symbol, side=sl_side, type="STOP",
+                    stopPrice=sl_rounded, price=sl_rounded,
+                    quantity=qty, reduceOnly=True, timeInForce="GTC",
                 )
                 sl_placed = bool(_sl_resp.get("orderId") or _sl_resp.get("algoId"))
                 break
@@ -397,8 +398,9 @@ def place_sl_tp(symbol: str, side: str, qty: float,
         for _try in range(2):
             try:
                 _tp_resp = client.futures_create_order(
-                    symbol=symbol, side=sl_side, type="TAKE_PROFIT_MARKET",
-                    stopPrice=tp_rounded, quantity=qty, reduceOnly=True,
+                    symbol=symbol, side=sl_side, type="TAKE_PROFIT",
+                    stopPrice=tp_rounded, price=tp_rounded,
+                    quantity=qty, reduceOnly=True, timeInForce="GTC",
                 )
                 tp_placed = bool(_tp_resp.get("orderId") or _tp_resp.get("algoId"))
                 break
@@ -407,6 +409,15 @@ def place_sl_tp(symbol: str, side: str, qty: float,
                     time.sleep(0.5)
 
     return {"sl_placed": sl_placed, "tp_placed": tp_placed}
+
+
+def cancel_all_orders(symbol: str):
+    """일반 주문 취소 (algo/conditional은 API 미지원 → 앱에서 수동 취소)"""
+    client = get_client()
+    try:
+        client.futures_cancel_all_open_orders(symbol=symbol)
+    except Exception:
+        pass
 
 
 # ── 펀딩비 조회 ──────────────────────────────────────────────────────

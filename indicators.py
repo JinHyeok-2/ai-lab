@@ -128,6 +128,32 @@ def calc_indicators(df: pd.DataFrame) -> dict:
         if _p2_hi > _p1_hi and _r2_hi < _r1_hi:
             rsi_divergence = "bearish"  # 가격 고점 상승, RSI 고점 하락
 
+    # 지지/저항 수준 (피봇 포인트 기반, 최근 20봉)
+    support = None
+    resistance = None
+    if len(df) >= 20:
+        _recent = df.iloc[-20:]
+        _lows = _recent["low"].values
+        _highs = _recent["high"].values
+        # 피봇 저점/고점: 좌우 2봉보다 낮은/높은 봉
+        for i in range(2, len(_lows) - 2):
+            if _lows[i] < _lows[i-1] and _lows[i] < _lows[i-2] and _lows[i] < _lows[i+1] and _lows[i] < _lows[i+2]:
+                if support is None or _lows[i] > support:  # 가장 가까운 지지
+                    support = round(float(_lows[i]), 4)
+            if _highs[i] > _highs[i-1] and _highs[i] > _highs[i-2] and _highs[i] > _highs[i+1] and _highs[i] > _highs[i+2]:
+                if resistance is None or _highs[i] < resistance:  # 가장 가까운 저항
+                    resistance = round(float(_highs[i]), 4)
+
+    # EMA 크로스 감지 (최근 3봉 내 크로스)
+    ema_cross = None
+    if ema20 is not None and ema50 is not None and len(ema20.dropna()) >= 3:
+        _e20_now, _e50_now = float(ema20.iloc[-1]), float(ema50.iloc[-1])
+        _e20_prev, _e50_prev = float(ema20.iloc[-3]), float(ema50.iloc[-3])
+        if _e20_prev <= _e50_prev and _e20_now > _e50_now:
+            ema_cross = "golden"  # 골든크로스
+        elif _e20_prev >= _e50_prev and _e20_now < _e50_now:
+            ema_cross = "death"   # 데드크로스
+
     current_price = round(float(close.iloc[-1]), 2)
     prev_close    = round(float(close.iloc[-2]), 2)
     change_pct    = round((current_price - prev_close) / prev_close * 100, 2)
@@ -155,6 +181,9 @@ def calc_indicators(df: pd.DataFrame) -> dict:
         "cvd_trend":      cvd_trend,
         "cvd_delta_pct":  cvd_delta_pct,
         "rsi_divergence": rsi_divergence,
+        "ema_cross":      ema_cross,
+        "support":        support,
+        "resistance":     resistance,
     }
 
 def format_for_agent(symbol: str, indicators: dict, label: str = "") -> str:

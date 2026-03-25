@@ -127,6 +127,19 @@ def _score_symbol(sym: str) -> dict | None:
         if price <= 0:
             return None
 
+        # 유동성 필터: 24h 거래대금 $5M 미만 제외 (저유동성 종목 대형 손실 방지)
+        try:
+            _vol_24h = float(klines_1h["volume"].sum()) * price  # 1h × 60캔들 ≈ 60h 근사
+            _daily_vol = _vol_24h * 24 / max(len(klines_1h), 1)  # 24h 추정
+            if _daily_vol < 5_000_000:
+                return None
+        except Exception:
+            pass
+
+        # 신규 상장 필터: 4h 데이터 42캔들(7일) 미만이면 제외
+        if len(klines_4h) < 42:
+            return None
+
         score    = 0
         signals  = []
         direction = "wait"
@@ -395,6 +408,37 @@ def _score_symbol(sym: str) -> dict | None:
         elif _oppose >= 3:
             score -= 15
             signals.append(f"방향불일치{_oppose}/4역행")
+
+        # 17. CVD 기반 스코어링 (최대 12점 / -8점)
+        _cvd = ind_15m.get("cvd_trend")
+        _cvd_pct = ind_15m.get("cvd_delta_pct", 0) or 0
+        if direction == "long" and _cvd == "up" and _cvd_pct > 10:
+            score += 12
+            signals.append(f"CVD매수압력↑{_cvd_pct:.0f}%")
+        elif direction == "long" and _cvd == "down" and _cvd_pct < -10:
+            score -= 8
+            signals.append(f"CVD매도압력↑롱위험")
+
+        # 18. VWAP 위치 필터 (최대 10점 / -8점)
+        _vwap = ind_15m.get("vwap")
+        if _vwap and price > 0:
+            if direction == "long" and price > _vwap:
+                score += 10
+                signals.append("VWAP위(매수우위)")
+            elif direction == "long" and price < _vwap * 0.98:
+                score -= 8
+                signals.append("VWAP아래(매수약세)")
+
+        # 19. EMA 크로스 (최대 15점 / -10점)
+        _ema_cross = ind_15m.get("ema_cross")
+        if _ema_cross == "golden":
+            score += 15
+            signals.append("EMA골든크로스")
+            if direction == "wait":
+                direction = "long"
+        elif _ema_cross == "death" and direction == "long":
+            score -= 10
+            signals.append("EMA데드크로스→롱감점")
 
         if score < 20:
             return None

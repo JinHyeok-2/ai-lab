@@ -106,6 +106,7 @@ try:
     from config import MAX_USDT_ALT, MAX_ALT_POSITIONS, ALT_LEVERAGE, ALT_ATR_SL_MULT, ALT_ATR_TP_MULT, ALT_SCAN_LIMIT, ALT_MIN_SCORE, ALT_AUTO_CONFIDENCE, ALT_MANUAL_MIN_CONF, POSITION_PCT_ALT
     from alt_scanner import get_alt_futures_symbols, screen_altcoins, check_binance_announcements, check_upbit_announcements, check_okx_announcements, check_coinbase_listings, run_alt_analysis
     from surge_detector import detect_surges, get_snapshot_count, get_snapshot_age_minutes
+    from signal_queue import push_signal
     BINANCE_READY = True
 except Exception as e:
     BINANCE_READY = False
@@ -1218,7 +1219,7 @@ def calc_confidence(result: dict) -> tuple:
     else:
         score -= 10
 
-    # 2. RL 앙상블 신호 (ETH 전용, exp14+exp08+seed700 만장일치)
+    # 2. RL 앙상블 신호 (ETH 전용, exp14+seed700+eth_seed800 만장일치)
     rl = result.get("rl", {})
     if rl.get("available"):
         rl_type = rl.get("type", "wait")
@@ -2064,15 +2065,15 @@ def create_chart(df: pd.DataFrame) -> "go.Figure":
 # ── RL 앙상블 모델 로드 (캐시) ────────────────────────────────────
 @st.cache_resource
 def _load_ensemble():
-    """ETH: exp14+exp08+seed700 (만장일치+폴백) / BTC: exp14+seed100+seed200 (다수결)"""
+    """ETH: exp14+seed700+eth_seed800 (만장일치+폴백) / BTC: exp14+seed100+seed200 (다수결)"""
     try:
         from stable_baselines3 import PPO
         base = Path(__file__).parent / "rl-lab/models"
-        # ETH 모델
+        # ETH 모델 (v2: exp08→eth_seed800 교체, WF 4/4전승)
         eth_paths = {
             "exp14": base / "exp14/ppo_eth_30m.zip",
-            "exp08": base / "exp08/ppo_eth_30m.zip",
             "seed700": base / "seed700/ppo_eth_30m.zip",
+            "eth_seed800": base / "eth_seed800/ppo_eth_30m.zip",
         }
         # BTC 모델
         btc_paths = {
@@ -2085,7 +2086,7 @@ def _load_ensemble():
         eth_ok = all(p.exists() for p in eth_paths.values())
         if eth_ok:
             result["eth"] = {k: PPO.load(str(p)) for k, p in eth_paths.items()}
-            add_log(f"✅ ETH RL 앙상블 로드 (exp14+exp08+seed700, 만장일치)")
+            add_log(f"✅ ETH RL 앙상블 로드 (exp14+seed700+eth_seed800, 만장일치)")
         else:
             add_log(f"⚠️ ETH RL 모델 누락")
         # BTC 로드
@@ -2194,7 +2195,8 @@ def get_rl_signal(symbol: str) -> dict:
                 if _row:
                     from datetime import datetime as _dt
                     _entry_time = _dt.strptime(_row[0], "%Y-%m-%d %H:%M:%S")
-                    _now = _dt.utcnow()
+                    from datetime import timezone as _tz
+                    _now = _dt.now(tz=_tz.utc).replace(tzinfo=None)
                     _minutes = (_now - _entry_time).total_seconds() / 60
                     hold_val = float(np.clip(_minutes / 30 / 50, 0, 1))  # 캔들 수 / 50
             else:
@@ -2208,7 +2210,8 @@ def get_rl_signal(symbol: str) -> dict:
                 if _row:
                     from datetime import datetime as _dt
                     _close_time = _dt.strptime(_row[0], "%Y-%m-%d %H:%M:%S")
-                    _now = _dt.utcnow()
+                    from datetime import timezone as _tz
+                    _now = _dt.now(tz=_tz.utc).replace(tzinfo=None)
                     _candles_since = (_now - _close_time).total_seconds() / 60 / 30
                     cooldown_val = float(np.clip(max(0, 8 - _candles_since) / 10, 0, 1))
         except Exception:
@@ -2452,6 +2455,20 @@ def _should_trade(auto_run: bool, confidence: int = 0, symbol: str = "") -> bool
 
 
 _ANALYSIS_COOLDOWN = 60  # 동일 심볼 분석 최소 간격 (테스트: 3분→1분)
+
+# Claude 자동 호출 시간당 상한 (수동 분석은 제한 없음)
+_CLAUDE_RATE_LIMIT = 10  # 시간당 최대 10회
+_claude_call_log = []    # 호출 시각 기록
+
+def _check_claude_rate_limit():
+    """시간당 호출 상한 확인. True=허용, False=차단"""
+    global _claude_call_log
+    now = time.time()
+    _claude_call_log = [t for t in _claude_call_log if now - t < 3600]
+    if len(_claude_call_log) >= _CLAUDE_RATE_LIMIT:
+        return False
+    _claude_call_log.append(now)
+    return True
 
 def run_analysis(symbol: str, execute_trade: bool = False):
     # ── 분석 폭풍 방지: 동일 심볼 3분 쿨다운 ──
@@ -3145,9 +3162,10 @@ wait은 절대 금지합니다."""
                 if _em["errors"]:
                     for _err in _em["errors"]:
                         add_log(f"🚨 청산 오류: {_err}", "error")
-                if st.session_state.get("tg_notify", True):
-                    send_daily_limit_alert(*_tg(),
-                                           _daily_loss_total, MAX_DAILY_LOSS)
+                # 일일 손실 한도 텔레그램 알림 비활성화 (불필요한 알림 제거)
+                # if st.session_state.get("tg_notify", True):
+                #     send_daily_limit_alert(*_tg(),
+                #                            _daily_loss_total, MAX_DAILY_LOSS)
                 execute_trade = False
         except Exception as e:
             # 잔고 조회 실패 시 안전하게 거래 차단 (한도 우회 방지)
@@ -3236,8 +3254,9 @@ wait은 절대 금지합니다."""
         _price  = ind.get("price", 0) or 0
 
         # SL/TP: trader JSON 우선, 없으면 ATR 폴백 (ADX 동적 R:R)
-        # 최소 SL 거리: 가격의 2.0% (15m 크립토 노이즈 대비, 1.5%→2.0% 상향)
+        # SL 거리 제한: 최소 2.0%, 최대 10% (건당 손실 한도 초과 방지)
         _MIN_SL_PCT = 0.02
+        _MAX_SL_PCT = 0.10
 
         def _enforce_min_sl(side: str, sl_val, price_val):
             """최소 SL 거리 보장 + 방향 오류 수정"""
@@ -3258,6 +3277,14 @@ wait은 절대 금지합니다."""
             elif side == "SELL" and sl_val - price_val < _min_dist:
                 sl_val = round(price_val + _min_dist, 2)
                 add_log(f"⚠️ SL 최소거리 보정: ${sl_val} (≥{_MIN_SL_PCT*100}%)")
+            # 최대 거리 제한 (건당 손실 한도 초과 방지)
+            _max_dist = price_val * _MAX_SL_PCT
+            if side == "BUY" and price_val - sl_val > _max_dist:
+                sl_val = round(price_val - _max_dist, 2)
+                add_log(f"🚨 SL 최대거리 보정: ${sl_val} (≤{_MAX_SL_PCT*100}%)")
+            elif side == "SELL" and sl_val - price_val > _max_dist:
+                sl_val = round(price_val + _max_dist, 2)
+                add_log(f"🚨 SL 최대거리 보정: ${sl_val} (≤{_MAX_SL_PCT*100}%)")
             return sl_val
 
         def _resolve_sl_tp(side: str):
@@ -3599,11 +3626,11 @@ if BINANCE_READY and not st.session_state.tg_polling_started:
         start_polling_thread(_tg_t, _tg_c)
         st.session_state.tg_polling_started = True
 
-# ── 알트 스캔 백그라운드 스레드 시작 (최초 1회, 5분마다 독립 실행) ────
-if BINANCE_READY and st.session_state.get("alt_auto_scan", True) and not st.session_state.get("alt_scan_thread_started"):
-    from alt_scan_thread import start_alt_scan_thread
-    start_alt_scan_thread()
-    st.session_state.alt_scan_thread_started = True
+# ── 알트 스캔 백그라운드 스레드 (비활성화: position_updater가 LLM 없이 담당) ────
+# if BINANCE_READY and st.session_state.get("alt_auto_scan", True) and not st.session_state.get("alt_scan_thread_started"):
+#     from alt_scan_thread import start_alt_scan_thread
+#     start_alt_scan_thread()
+#     st.session_state.alt_scan_thread_started = True
 
 # ── 텔레그램 명령어 처리 ─────────────────────────────────────────────
 if BINANCE_READY:
@@ -3963,7 +3990,7 @@ with st.sidebar:
     auto_interval = st.selectbox(
         "분석 간격",
         ["비활성", "10분", "30분", "1시간"],
-        index=1,  # 기본 10분
+        index=0,  # 기본 비활성 (position_updater가 LLM 없이 거래 담당)
         key="auto_interval_select"
     )
 
@@ -4561,6 +4588,10 @@ if auto_interval != "비활성":
                 if _sym in _active_syms and _skip_counter % 3 != 0:
                     add_log(f"⏭️ {_sym} 포지션 보유 중 → 분석 스킵 ({_skip_counter % 3}/3)")
                     continue
+                # Claude 시간당 상한 체크
+                if not _check_claude_rate_limit():
+                    add_log(f"⚠️ Claude 시간당 상한 도달 ({_CLAUDE_RATE_LIMIT}회/시간) → 자동 분석 스킵")
+                    break
                 with st.spinner(f"⏰ 자동 분석: {_sym}..."):
                     run_analysis(_sym, execute_trade=st.session_state.auto_run)
             st.session_state.last_auto_time = time.time()
@@ -4774,7 +4805,7 @@ if BINANCE_READY and st.session_state.get("alt_auto_scan", True):
                 pass
 
             # 시간대 필터: 해제 (데이터 축적 우선, 50건+ 후 재검토)
-            _utc_hour = datetime.utcnow().hour
+            _utc_hour = datetime.now(tz=__import__('datetime').timezone.utc).hour
             _kst_hour = (_utc_hour + 9) % 24
             _low_liq_hours = False  # 저유동성 축소도 해제
 
@@ -5105,35 +5136,10 @@ if BINANCE_READY and st.session_state.get("alt_auto_scan", True):
             if _pb_ok:
                 _pb_done.append(_pb_sym)
                 add_log(f"🎯 풀백 진입 조건 충족: {_pb_sym} {_pb_change:+.1f}% (감지가 대비)")
-                # 분석 + 진입
-                if _pb_sym not in st.session_state.alt_analysis and _pb_sym not in _analyzing:
-                    _analyzing.add(_pb_sym)
-                    try:
-                        _pb_kl2 = get_klines(_pb_sym, "15m", 60)
-                        _pb_ind = calc_indicators(_pb_kl2)
-                        _pb_kl_1h = get_klines(_pb_sym, "1h", 60)
-                        _pb_ind_1h = calc_indicators(_pb_kl_1h)
-                        _pb_cand = {
-                            "symbol": _pb_sym, "score": _pb_info.get("score", 70),
-                            "signals": [f"풀백진입({_pb_info.get('source','')})"],
-                            "direction": _pb_dir, "price_change_1h": 0,
-                            "vol_ratio": 1, "rsi": _pb_ind.get("rsi", 50),
-                            "funding": 0, "price": _pb_cur,
-                            "atr": _pb_ind.get("atr", 0), "atr_pct": 0,
-                            "indicators": _pb_ind, "indicators_1h": _pb_ind_1h,
-                        }
-                        _pb_res = run_alt_analysis(_pb_cand)
-                        _pb_conf, _pb_d = calc_confidence_alt(_pb_cand, _pb_res, _btc_ind_cache)
-                        _pb_res["alt_confidence"] = _pb_conf
-                        _pb_res.get("trader_json", {})["confidence"] = _pb_conf
-                        st.session_state.alt_analysis[_pb_sym] = _pb_res
-                        add_log(f"🎯 {_pb_sym} 풀백 분석 완료 (신뢰도 {_pb_conf}%)")
-                        _pb_tj = _pb_res.get("trader_json", {})
-                        # 풀백도 최소 50% 이상 (기존 40% → 저신뢰 진입 방지)
-                        if _pb_conf >= 50 and _pb_d != "wait":
-                            _alt_place_order(_pb_sym, _pb_d, _pb_tj, _pb_cand, source=_pb_info.get("source", "screener"))
-                    except Exception as _pb_e:
-                        add_log(f"풀백 분석 오류: {_pb_sym} {_pb_e}", "error")
+                # 풀백 → 시그널 큐 전달 (LLM 없이, position_updater가 우선 스캔)
+                push_signal(_pb_sym, 'pullback', direction=_pb_dir, priority=4,
+                            meta={'source': _pb_info.get('source', ''), 'change_pct': round(_pb_change, 2)})
+                add_log(f"🎯 {_pb_sym} 풀백 → 시그널 큐 전달 ({_pb_change:+.1f}%)")
         except Exception:
             pass
     for _done_sym in _pb_done:
@@ -5159,42 +5165,16 @@ if BINANCE_READY and st.session_state.get("alt_auto_scan", True):
             st.session_state.alt_last_announcement_time = time.time()
             if _ann_r.get("found"):
                 add_log(f"📢 공지 감지: {_ann_r.get('summary','')}")
-                # 공지 기반 자동 분석 + 자동 주문 (신뢰도 무관, 최우선 신호)
+                # 공지 → 시그널 큐 전달 (LLM 없이, position_updater가 우선 스캔)
                 if st.session_state.get("alt_auto_trade", True):
                     for _ann_item in _ann_r.get("announcements", []):
                         _ann_sym = _ann_item.get("symbol", "")
                         _ann_sig = _ann_item.get("signal", "wait")
                         if not _ann_sym or _ann_sig == "wait":
                             continue
-                        if _ann_sym in st.session_state.alt_analysis or _ann_sym in _analyzing:
-                            continue
-                        _analyzing.add(_ann_sym)  # 이미 분석한 종목 스킵
-                        try:
-                            from binance_client import get_klines as _gk2
-                            from indicators import calc_indicators as _ci2
-                            _kl2 = _gk2(_ann_sym, "15m", 30)
-                            _ind2 = _ci2(_kl2)
-                            _cand2 = {
-                                "symbol": _ann_sym, "score": 90,
-                                "signals": [f"바이낸스 공지: {_ann_item.get('type','')}"],
-                                "direction": _ann_sig, "price_change_1h": 0,
-                                "vol_ratio": 1, "rsi": _ind2.get("rsi", 50),
-                                "funding": 0, "price": _ind2.get("price", 0),
-                                "atr": _ind2.get("atr", 0), "atr_pct": 0,
-                                "indicators": _ind2, "indicators_1h": {},
-                            }
-                            _res2 = run_alt_analysis(_cand2)
-                            st.session_state.alt_analysis[_ann_sym] = _res2
-                            _tj2 = _res2.get("trader_json", {})
-                            # 독립 신뢰도 계산
-                            _alt_conf2, _alt_dir2 = calc_confidence_alt(_cand2, _res2, _btc_ind_cache)
-                            _tj2["confidence"] = _alt_conf2
-                            _res2["alt_confidence"] = _alt_conf2
-                            # 공지는 신뢰도 50% 이상이면 자동 주문
-                            if _alt_conf2 >= ALT_AUTO_CONFIDENCE and _alt_dir2 != "wait":
-                                _alt_place_order(_ann_sym, _alt_dir2, _tj2, _cand2, source="binance")
-                        except Exception as _e2:
-                            add_log(f"공지 자동 분석 오류: {_ann_sym} {_e2}", "error")
+                        push_signal(_ann_sym, 'announcement', direction=_ann_sig, priority=1,
+                                    meta={'type': _ann_item.get('type', ''), 'exchange': 'binance'})
+                        add_log(f"📢 {_ann_sym} → 시그널 큐 전달 (공지: {_ann_item.get('type','')})")
         except Exception:
             pass
 
@@ -5214,34 +5194,9 @@ if BINANCE_READY and st.session_state.get("alt_auto_scan", True):
                         _usig = _uitem.get("signal", "wait")
                         if not _usym or _usig == "wait":
                             continue
-                        if _usym in st.session_state.alt_analysis or _usym in _analyzing:
-                            continue
-                        _analyzing.add(_usym)
-                        try:
-                            _ukl = get_klines(_usym, "15m", 60)
-                            _uind = calc_indicators(_ukl)
-                            _ukl_1h = get_klines(_usym, "1h", 60)
-                            _uind_1h = calc_indicators(_ukl_1h)
-                            _ucand = {
-                                "symbol": _usym, "score": 85,
-                                "signals": [f"업비트: {_uitem.get('type','')}"],
-                                "direction": _usig, "price_change_1h": 0,
-                                "vol_ratio": 1, "rsi": _uind.get("rsi", 50),
-                                "funding": 0, "price": _uind.get("price", 0),
-                                "atr": _uind.get("atr", 0), "atr_pct": 0,
-                                "indicators": _uind, "indicators_1h": _uind_1h,
-                            }
-                            _ures = run_alt_analysis(_ucand)
-                            _uconf, _udir = calc_confidence_alt(_ucand, _ures, _btc_ind_cache)
-                            _ures["alt_confidence"] = _uconf
-                            _ures.get("trader_json", {})["confidence"] = _uconf
-                            st.session_state.alt_analysis[_usym] = _ures
-                            add_log(f"🇰🇷 {_usym} 업비트 공지 분석 완료 (신뢰도 {_uconf}%)")
-                            _utj = _ures.get("trader_json", {})
-                            if _uconf >= ALT_AUTO_CONFIDENCE and _udir != "wait":
-                                _alt_place_order(_usym, _udir, _utj, _ucand, source="upbit")
-                        except Exception as _ue:
-                            add_log(f"업비트 공지 분석 오류: {_usym} {_ue}", "error")
+                        push_signal(_usym, 'announcement', direction=_usig, priority=2,
+                                    meta={'type': _uitem.get('type', ''), 'exchange': 'upbit'})
+                        add_log(f"🇰🇷 {_usym} → 시그널 큐 전달 (업비트 공지)")
         except Exception:
             pass
 
@@ -5261,34 +5216,9 @@ if BINANCE_READY and st.session_state.get("alt_auto_scan", True):
                         _osig = _oitem.get("signal", "wait")
                         if not _osym or _osig == "wait":
                             continue
-                        if _osym in st.session_state.alt_analysis or _osym in _analyzing:
-                            continue
-                        _analyzing.add(_osym)
-                        try:
-                            _okl = get_klines(_osym, "15m", 60)
-                            _oind = calc_indicators(_okl)
-                            _okl_1h = get_klines(_osym, "1h", 60)
-                            _oind_1h = calc_indicators(_okl_1h)
-                            _ocand = {
-                                "symbol": _osym, "score": 80,
-                                "signals": [f"OKX: {_oitem.get('type','')}"],
-                                "direction": _osig, "price_change_1h": 0,
-                                "vol_ratio": 1, "rsi": _oind.get("rsi", 50),
-                                "funding": 0, "price": _oind.get("price", 0),
-                                "atr": _oind.get("atr", 0), "atr_pct": 0,
-                                "indicators": _oind, "indicators_1h": _oind_1h,
-                            }
-                            _ores = run_alt_analysis(_ocand)
-                            _oconf, _odir = calc_confidence_alt(_ocand, _ores, _btc_ind_cache)
-                            _ores["alt_confidence"] = _oconf
-                            _ores.get("trader_json", {})["confidence"] = _oconf
-                            st.session_state.alt_analysis[_osym] = _ores
-                            add_log(f"🔶 {_osym} OKX 공지 분석 완료 (신뢰도 {_oconf}%)")
-                            _otj = _ores.get("trader_json", {})
-                            if _oconf >= ALT_AUTO_CONFIDENCE and _odir != "wait":
-                                _alt_place_order(_osym, _odir, _otj, _ocand, source="okx")
-                        except Exception as _oe:
-                            add_log(f"OKX 공지 분석 오류: {_osym} {_oe}", "error")
+                        push_signal(_osym, 'announcement', direction=_osig, priority=2,
+                                    meta={'type': _oitem.get('type', ''), 'exchange': 'okx'})
+                        add_log(f"🔶 {_osym} → 시그널 큐 전달 (OKX 공지)")
         except Exception:
             pass
 
@@ -5308,34 +5238,9 @@ if BINANCE_READY and st.session_state.get("alt_auto_scan", True):
                         _csig = _citem.get("signal", "wait")
                         if not _csym or _csig == "wait":
                             continue
-                        if _csym in st.session_state.alt_analysis or _csym in _analyzing:
-                            continue
-                        _analyzing.add(_csym)
-                        try:
-                            _ckl = get_klines(_csym, "15m", 60)
-                            _cind = calc_indicators(_ckl)
-                            _ckl_1h = get_klines(_csym, "1h", 60)
-                            _cind_1h = calc_indicators(_ckl_1h)
-                            _ccand = {
-                                "symbol": _csym, "score": 80,
-                                "signals": [f"Coinbase: {_citem.get('type','')}"],
-                                "direction": _csig, "price_change_1h": 0,
-                                "vol_ratio": 1, "rsi": _cind.get("rsi", 50),
-                                "funding": 0, "price": _cind.get("price", 0),
-                                "atr": _cind.get("atr", 0), "atr_pct": 0,
-                                "indicators": _cind, "indicators_1h": _cind_1h,
-                            }
-                            _cres = run_alt_analysis(_ccand)
-                            _cconf, _cdir = calc_confidence_alt(_ccand, _cres, _btc_ind_cache)
-                            _cres["alt_confidence"] = _cconf
-                            _cres.get("trader_json", {})["confidence"] = _cconf
-                            st.session_state.alt_analysis[_csym] = _cres
-                            add_log(f"🔵 {_csym} 코인베이스 상장 분석 완료 (신뢰도 {_cconf}%)")
-                            _ctj = _cres.get("trader_json", {})
-                            if _cconf >= ALT_AUTO_CONFIDENCE and _cdir != "wait":
-                                _alt_place_order(_csym, _cdir, _ctj, _ccand, source="coinbase")
-                        except Exception as _ce:
-                            add_log(f"코인베이스 분석 오류: {_csym} {_ce}", "error")
+                        push_signal(_csym, 'announcement', direction=_csig, priority=2,
+                                    meta={'type': _citem.get('type', ''), 'exchange': 'coinbase'})
+                        add_log(f"🔵 {_csym} → 시그널 큐 전달 (코인베이스 상장)")
         except Exception:
             pass
 
@@ -5357,44 +5262,12 @@ if BINANCE_READY and st.session_state.get("alt_auto_scan", True):
                             or _ssym in _pullback_wl):
                         continue
 
-                    # 강한 급등 즉시 진입: score≥80이면 풀백 없이 추세추종
+                    # 급등 → 시그널 큐 전달 (LLM 없이, position_updater가 우선 스캔)
                     if _sg["score"] >= 80:
-                        _analyzing.add(_ssym)
-                        try:
-                            from binance_client import get_klines as _sgk
-                            from indicators import calc_indicators as _sci
-                            _sg_kl = _sgk(_ssym, "15m", 60)
-                            _sg_ind = _sci(_sg_kl)
-                            _sg_adx = _sg_ind.get("adx", 0) or 0
-                            # 숏 허용 (2026-03-23 해제)
-                            # ADX≥30 강한 추세 확인 → 즉시 분석+진입
-                            if _sg_adx >= 30:
-                                _sg_kl_1h = _sgk(_ssym, "1h", 60)
-                                _sg_ind_1h = _sci(_sg_kl_1h)
-                                _sg_cand = {
-                                    "symbol": _ssym, "score": _sg["score"],
-                                    "signals": [f"강한급등({_sg['surge_type']})"],
-                                    "direction": _sg["direction"], "price_change_1h": 0,
-                                    "vol_ratio": 1, "rsi": _sg_ind.get("rsi", 50),
-                                    "funding": 0, "price": _sg["price"],
-                                    "atr": _sg_ind.get("atr", 0), "atr_pct": 0,
-                                    "adx": _sg_adx,
-                                    "indicators": _sg_ind, "indicators_1h": _sg_ind_1h,
-                                }
-                                _sg_res = run_alt_analysis(_sg_cand)
-                                _sg_conf, _sg_dir = calc_confidence_alt(_sg_cand, _sg_res, _btc_ind_cache)
-                                _sg_res["alt_confidence"] = _sg_conf
-                                _sg_res.get("trader_json", {})["confidence"] = _sg_conf
-                                _sg_res["_cached_at"] = time.time()
-                                st.session_state.alt_analysis[_ssym] = _sg_res
-                                add_log(f"⚡ {_ssym} 강한 급등 즉시 분석 (score={_sg['score']}, ADX={_sg_adx:.0f}, 신뢰도 {_sg_conf}%)")
-                                if _sg_dir != "wait" and _sg_conf >= ALT_AUTO_CONFIDENCE:
-                                    _alt_place_order(_ssym, _sg_dir, _sg_res.get("trader_json", {}), _sg_cand, source="surge")
-                                continue  # 즉시 진입 처리 완료
-                        except Exception as _sg_e:
-                            add_log(f"강한 급등 즉시 분석 오류: {_ssym} {_sg_e}", "error")
-                        finally:
-                            _analyzing.discard(_ssym)
+                        push_signal(_ssym, 'surge', direction=_sg["direction"], priority=3,
+                                    meta={'surge_type': _sg['surge_type'], 'score': _sg['score']})
+                        add_log(f"⚡ {_ssym} 강한 급등 → 시그널 큐 전달 (score={_sg['score']})")
+                        continue
 
                     # 양방향 풀백 등록 허용
                     _pullback_wl[_ssym] = {
@@ -5639,97 +5512,15 @@ if BINANCE_READY and st.session_state.get("alt_auto_scan", True):
                 if _results_auto:
                     _top = _results_auto[0]
                     add_log(f"🔥 알트 스캔: {_top['symbol']} 1위 (점수 {_top['score']})")
-                    # 상위 3개 종목 병렬 분석 + 자동 주문 (포지션 한도 시 중단)
+                    # 상위 종목 → 시그널 큐 전달 (LLM 없이, position_updater가 스코어링)
                     if st.session_state.get("alt_auto_trade", True):
-                        _now_ts = time.time()
-                        # 분석 대상 필터링
-                        _to_analyze = []
-                        for _rank_cand in _results_auto[:5]:  # 테스트2: top3→5
+                        for _rank_cand in _results_auto[:5]:
                             if _rank_cand["score"] < ALT_MIN_SCORE:
                                 continue
-                            # 양방향 분석 허용 (숏 해제 2026-03-23)
                             _rc_sym = _rank_cand["symbol"]
-                            _cached = st.session_state.alt_analysis.get(_rc_sym)
-                            if _cached and (_now_ts - _cached.get("_cached_at", 0)) < 300:  # 테스트2: 15분→5분
-                                continue
-                            _to_analyze.append(_rank_cand)
-                        # 병렬 분석 실행
-                        _analysis_results = {}
-                        if _to_analyze:
-                            def _run_analysis(_cand):
-                                try:
-                                    return _cand["symbol"], run_alt_analysis(_cand)
-                                except Exception as _e:
-                                    return _cand["symbol"], None
-                            with ThreadPoolExecutor(max_workers=min(3, len(_to_analyze))) as _ex:
-                                _futs = [_ex.submit(_run_analysis, c) for c in _to_analyze]
-                                for _f in _futs:
-                                    _sym_r, _res_r = _f.result()
-                                    if _res_r:
-                                        _analysis_results[_sym_r] = _res_r
-                        # 결과 처리 + 주문 (순차)
-                        for _rank_cand in _to_analyze:
-                            _rc_sym = _rank_cand["symbol"]
-                            _res_top = _analysis_results.get(_rc_sym)
-                            if not _res_top:
-                                continue
-                            # 포지션 한도 재확인
-                            try:
-                                _cur_alt = len([p for p in get_positions() if p["symbol"] not in SYMBOLS])
-                                if _cur_alt >= MAX_ALT_POSITIONS:
-                                    add_log(f"⏭️ 알트 분석 중단: 포지션 한도 {_cur_alt}/{MAX_ALT_POSITIONS}")
-                                    break
-                            except Exception:
-                                pass
-                            try:
-                                _res_top["_cached_at"] = _now_ts
-                                st.session_state.alt_analysis[_rc_sym] = _res_top
-                                _tj_top  = _res_top.get("trader_json", {})
-                                _conf_top, _dir_top = calc_confidence_alt(_rank_cand, _res_top, _btc_ind_cache)
-                                _tj_top["confidence"] = _conf_top
-                                _res_top["alt_confidence"] = _conf_top
-                                # 승률 기반 동적 confidence 임계값: 10건+ & 승률<30% → +10pt
-                                _dyn_conf_threshold = ALT_AUTO_CONFIDENCE
-                                try:
-                                    _alt_wr = trade_db.get_source_performance(recent_n=30)
-                                    _alt_perf = _alt_wr.get("alt_screener", {})
-                                    if _alt_perf.get("trades", 0) >= 10 and _alt_perf.get("win_rate", 50) < 30:
-                                        _dyn_conf_threshold = ALT_AUTO_CONFIDENCE + 10
-                                except Exception:
-                                    pass
-                                # 양방향: LLM 판단 + 신뢰도 충족 시 진입 (숏은 +5pt 보수적)
-                                _eff_threshold = _dyn_conf_threshold + (5 if _dir_top == "short" else 0)
-                                if _dir_top != "wait" and _conf_top >= _eff_threshold:
-                                    _alt_place_order(_rc_sym, _dir_top, _tj_top, _rank_cand)
-                                else:
-                                    add_log(f"⏸ 알트 자동 주문 보류: {_rc_sym} 신뢰도 {_conf_top}% dir={_dir_top} (기준 {_dyn_conf_threshold}%)")
-                                # 알트 분석 이력 저장 (진입/보류 모두)
-                                try:
-                                    _alt_ind = _rank_cand.get("indicators", {})
-                                    _alt_ind4h = _rank_cand.get("indicators_4h", {})
-                                    trade_db.save_analysis({
-                                        "symbol": _rc_sym,
-                                        "decision": _dir_top,
-                                        "confidence": _conf_top,
-                                        "entry_price": _tj_top.get("entry"),
-                                        "sl": _tj_top.get("sl"),
-                                        "tp": _tj_top.get("tp"),
-                                        "rsi_15m": _alt_ind.get("rsi"),
-                                        "adx_15m": _alt_ind.get("adx"),
-                                        "ema20_15m": _alt_ind.get("ema20"),
-                                        "ema50_15m": _alt_ind.get("ema50"),
-                                        "ema20_4h": _alt_ind4h.get("ema20"),
-                                        "ema50_4h": _alt_ind4h.get("ema50"),
-                                        "atr": _rank_cand.get("atr"),
-                                        "btc_trend": "up" if (_btc_ind_cache.get("ema20", 0) or 0) > (_btc_ind_cache.get("ema50", 0) or 0) else "down",
-                                        "rl_signal": "",
-                                        "llm_reason": _tj_top.get("reason", "")[:500],
-                                        "source": "alt_screener",
-                                        "filled": _dir_top != "wait" and _conf_top >= _dyn_conf_threshold,
-                                    })
-                                except Exception:
-                                    pass
-                            except Exception as _e3:
-                                add_log(f"알트 자동 분석 오류 ({_rc_sym}): {_e3}", "error")
+                            _rc_dir = _rank_cand.get("direction", "long")
+                            push_signal(_rc_sym, 'screener', direction=_rc_dir, priority=5,
+                                        meta={'score': _rank_cand['score']})
+                        add_log(f"🔥 알트 스캔 상위 → 시그널 큐 전달 ({len(_results_auto[:5])}건)")
             except Exception:
                 pass
