@@ -1808,6 +1808,27 @@ def calc_confidence_alt(candidate: dict, analysis: dict, btc_ind: dict = None) -
         if (direction == "long" and funding < -0.1) or (direction == "short" and funding > 0.1):
             score += 6  # 역방향 = 펀딩비 수취 보너스
 
+    # 16. RL 범용모델 시그널 (확률 기반 동적 가중치)
+    try:
+        _rl_alt = get_rl_signal(_sym_name)
+        if _rl_alt.get("available"):
+            _rl_type = _rl_alt.get("type", "wait")
+            _rl_bonus = _rl_alt.get("confidence_bonus", 0)
+            _long_prob = _rl_alt.get("long_prob", 0)
+            if _rl_type == "long" and direction == "long":
+                # 기본 +10 + 확률 보너스(1~5pt) = 최대 +15pt
+                score += 10 + _rl_bonus
+            elif _rl_type == "long" and direction == "short":
+                score -= 8   # RL 롱인데 숏 진입 → 페널티
+            elif _rl_type == "wait" and direction == "long":
+                # 관망이지만 롱 확률이 높으면 페널티 축소
+                if _long_prob >= 0.3:
+                    score -= 1   # 롱 확률 30%+ → 약한 페널티
+                else:
+                    score -= 4   # 롱 확률 낮음 → 강한 페널티
+    except Exception:
+        pass
+
     return max(0, min(100, score)), direction
 
 
@@ -2065,7 +2086,7 @@ def create_chart(df: pd.DataFrame) -> "go.Figure":
 # ── RL 앙상블 모델 로드 (캐시) ────────────────────────────────────
 @st.cache_resource
 def _load_ensemble():
-    """ETH: exp14+seed700+eth_seed800 (만장일치+폴백) / BTC: exp14+seed100+seed200 (다수결)"""
+    """ETH: exp14+seed700+eth_seed800 (만장일치+폴백) / BTC: exp14+seed100+seed200 (다수결) / ALT: 범용모델"""
     try:
         from stable_baselines3 import PPO
         base = Path(__file__).parent / "rl-lab/models"
@@ -2081,7 +2102,10 @@ def _load_ensemble():
             "btc_seed100": base / "btc_seed100/ppo_btc_30m.zip",
             "btc_seed200": base / "btc_seed200/ppo_btc_30m.zip",
         }
-        result = {"eth": None, "btc": None}
+        # ALT 범용 모델 (14코인 학습, 롱전용 3-action)
+        alt_path = base / "alt_universal_exp01/ppo_alt.zip"
+
+        result = {"eth": None, "btc": None, "alt": None}
         # ETH 로드
         eth_ok = all(p.exists() for p in eth_paths.values())
         if eth_ok:
@@ -2096,7 +2120,13 @@ def _load_ensemble():
             add_log(f"✅ BTC RL 앙상블 로드 (exp14+seed100+seed200, 다수결)")
         else:
             add_log(f"⚠️ BTC RL 모델 누락")
-        if not eth_ok and not btc_ok:
+        # ALT 로드
+        if alt_path.exists():
+            result["alt"] = PPO.load(str(alt_path))
+            add_log(f"✅ ALT RL 범용모델 로드 (14코인 학습, 롱전용)")
+        else:
+            add_log(f"⚠️ ALT RL 모델 누락")
+        if not eth_ok and not btc_ok and result["alt"] is None:
             return None
         return result
     except Exception as e:
@@ -2105,9 +2135,7 @@ def _load_ensemble():
 
 
 def get_rl_signal(symbol: str) -> dict:
-    """ETH/BTC 앙상블 RL 신호 (0=관망 1=롱 2=숏 3=청산)"""
-    if symbol not in ("ETHUSDT", "BTCUSDT"):
-        return {"available": False, "reason": "ETH/BTC 전용 모델"}
+    """ETH/BTC 앙상블 + ALT 범용 RL 신호 (ETH/BTC: 0~3, ALT: 0=관망 1=롱 2=청산)"""
     try:
         import numpy as np
         import pandas_ta as ta
@@ -2117,10 +2145,17 @@ def get_rl_signal(symbol: str) -> dict:
         if ensemble is None:
             return {"available": False, "reason": "앙상블 모델 파일 없음"}
 
-        asset_key = "eth" if symbol == "ETHUSDT" else "btc"
-        models = ensemble.get(asset_key)
-        if models is None:
-            return {"available": False, "reason": f"{asset_key.upper()} 모델 미로드"}
+        # 알트코인 → 범용 모델 분기
+        is_alt = symbol not in ("ETHUSDT", "BTCUSDT")
+        if is_alt:
+            alt_model = ensemble.get("alt")
+            if alt_model is None:
+                return {"available": False, "reason": "ALT 범용모델 미로드"}
+        else:
+            asset_key = "eth" if symbol == "ETHUSDT" else "btc"
+            models = ensemble.get(asset_key)
+            if models is None:
+                return {"available": False, "reason": f"{asset_key.upper()} 모델 미로드"}
 
         # 최근 30m 데이터 120캔들
         df = get_klines(symbol, "30m", 120)
@@ -2232,21 +2267,57 @@ def get_rl_signal(symbol: str) -> dict:
         obs = np.array(rows, dtype=np.float32).flatten()
 
         # --- 모델 예측 + 투표 ---
-        model_keys = list(models.keys())
-        votes = []
-        for k in model_keys:
-            a, _ = models[k].predict(obs, deterministic=True)
-            votes.append(int(a))
-
-        # 행동 마스킹: 숏(2) → 관망(0)으로 치환 (롱전용 운영)
-        votes = [0 if v == 2 else v for v in votes]
-
-        if symbol == "ETHUSDT":
-            # ETH: 만장일치 우선, 폴백으로 다수결
-            if len(set(votes)) == 1:
-                action = votes[0]
-                method = "unanimous"
+        import torch as _torch
+        if is_alt:
+            # ALT 범용 모델: 단일 모델 (0=관망, 1=롱, 2=청산) + action 확률
+            a, _ = alt_model.predict(obs, deterministic=True)
+            action = int(a)
+            # action probability 추출 → 확신도
+            try:
+                _obs_t = _torch.as_tensor(obs).unsqueeze(0).to(alt_model.device)
+                _dist = alt_model.policy.get_distribution(_obs_t)
+                _probs = _dist.distribution.probs.detach().cpu().numpy()[0]
+                action_prob = float(_probs[int(a)])  # 선택된 행동의 확률
+                long_prob = float(_probs[1])  # 롱 확률 (항상 추출)
+            except Exception:
+                action_prob, long_prob = 0.5, 0.0
+            # 알트 3-action → 표준 매핑: 2(청산)→3(청산)
+            if action == 2:
+                action = 3
+            method = "single"
+            vote_str = f"[alt_universal:{int(a)}(p={action_prob:.0%})]"
+            raw_votes = [int(a)]
+            # 확률 기반 동적 보너스: 확신 70%+ → +5pt, 50~70% → +3pt, <50% → +1pt
+            if action == 1:
+                confidence_bonus = 5 if action_prob >= 0.7 else (3 if action_prob >= 0.5 else 1)
             else:
+                confidence_bonus = 0
+        else:
+            model_keys = list(models.keys())
+            votes = []
+            for k in model_keys:
+                a, _ = models[k].predict(obs, deterministic=True)
+                votes.append(int(a))
+
+            # 행동 마스킹: 숏(2) → 관망(0)으로 치환 (롱전용 운영)
+            votes = [0 if v == 2 else v for v in votes]
+
+            if symbol == "ETHUSDT":
+                # ETH: 만장일치 우선, 폴백으로 다수결
+                if len(set(votes)) == 1:
+                    action = votes[0]
+                    method = "unanimous"
+                else:
+                    vote_count = Counter(votes)
+                    maj = vote_count.most_common(1)[0]
+                    if maj[1] >= 2:
+                        action = maj[0]
+                        method = "majority"
+                    else:
+                        action = 0
+                        method = "no_consensus"
+            else:
+                # BTC: 다수결 (2/3 이상)
                 vote_count = Counter(votes)
                 maj = vote_count.most_common(1)[0]
                 if maj[1] >= 2:
@@ -2255,28 +2326,24 @@ def get_rl_signal(symbol: str) -> dict:
                 else:
                     action = 0
                     method = "no_consensus"
-        else:
-            # BTC: 다수결 (2/3 이상)
-            vote_count = Counter(votes)
-            maj = vote_count.most_common(1)[0]
-            if maj[1] >= 2:
-                action = maj[0]
-                method = "majority"
-            else:
-                action = 0
-                method = "no_consensus"
+
+            vote_str = "[" + " ".join(f"{k}:{v}" for k, v in zip(model_keys, votes)) + "]"
+            raw_votes = votes
+            # ETH 만장일치 시 +5pt, BTC 다수결도 +5pt (승률 100% 검증)
+            confidence_bonus = 5 if method in ("unanimous", "majority") else 0
 
         action_map = {0: ("⚪ 관망", "wait"), 1: ("🟢 롱", "long"),
                       2: ("🔴 숏", "short"), 3: ("🔵 청산", "close")}
         label, atype = action_map.get(int(action), ("?", "wait"))
-        vote_str = "[" + " ".join(f"{k}:{v}" for k, v in zip(model_keys, votes)) + "]"
 
-        # ETH 만장일치 시 +5pt, BTC 다수결도 +5pt (승률 100% 검증)
-        confidence_bonus = 5 if method in ("unanimous", "majority") else 0
-
-        return {"available": True, "action": int(action), "label": label,
-                "type": atype, "votes": vote_str, "raw_votes": votes,
+        result = {"available": True, "action": int(action), "label": label,
+                "type": atype, "votes": vote_str, "raw_votes": raw_votes,
                 "method": method, "confidence_bonus": confidence_bonus}
+        # ALT 확률 정보 추가
+        if is_alt:
+            result["action_prob"] = round(action_prob, 3)
+            result["long_prob"] = round(long_prob, 3)
+        return result
 
     except Exception as e:
         return {"available": False, "reason": str(e)}

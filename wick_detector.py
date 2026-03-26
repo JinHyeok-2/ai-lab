@@ -16,9 +16,9 @@ from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 # ── 설정 ──
 SYMBOLS = ['ETHUSDT', 'BTCUSDT']
 CHECK_INTERVAL = 10       # 10초마다 체크
-WICK_RATIO = 0.60         # 밑꼬리가 전체 레인지의 60% 이상
-VOL_MULT = 5.0            # 거래량이 평균 대비 5배 이상
-MIN_DROP_PCT = 0.3        # 최소 낙폭 0.3% (노이즈 필터)
+WICK_RATIO = 0.50         # 밑꼬리가 전체 레인지의 50% 이상 (#6: 60→50, 감지 0건→완화)
+VOL_MULT = 3.0            # 거래량이 평균 대비 3배 이상 (#6: 5→3)
+MIN_DROP_PCT = 0.2        # 최소 낙폭 0.2% (#6: 0.3→0.2)
 MAX_CLOSE_DROP_PCT = 0.2  # 종가가 시가 대비 -0.2% 이내 (회복 확인)
 RSI_MAX = 80              # 15분 RSI 80 이상이면 과매수 → 스킵
 COOLDOWN_SEC = 1800       # 동일 종목 30분 쿨다운
@@ -28,7 +28,7 @@ TP_ATR_MULT = 3.0         # TP = ATR × 3 (빠른 익절)
 TP_MIN_PCT = 2.0          # TP 최소 2%
 
 # 진입금
-USDT_MAP = {'ETHUSDT': 10, 'BTCUSDT': 10}
+USDT_MAP = {'ETHUSDT': 20, 'BTCUSDT': 20}
 LEV_MAP = {'ETHUSDT': 3, 'BTCUSDT': 3}
 
 TG_TOKEN = TELEGRAM_TOKEN
