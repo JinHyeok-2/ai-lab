@@ -26,6 +26,8 @@ MAX_POSITIONS = 2         # 이 전략으로 최대 동시 보유
 SL_BUFFER_PCT = 0.1       # SL = 꼬리 저점 - 0.1%
 TP_ATR_MULT = 3.0         # TP = ATR × 3 (빠른 익절)
 TP_MIN_PCT = 2.0          # TP 최소 2%
+LIMIT_OFFSET_PCT = 0.05   # 꼬리 저점 대비 0.05% 아래에 지정가
+LIMIT_EXPIRE_SEC = 300    # 미체결 5분 후 자동 취소
 
 # 진입금
 USDT_MAP = {'ETHUSDT': 20, 'BTCUSDT': 20}
@@ -42,6 +44,7 @@ _last_candle = {}     # {symbol: last_processed_open_time}
 _vol_avg = {}         # {symbol: 20봉 평균 거래량 캐시}
 _vol_avg_ts = {}      # {symbol: 캐시 시각}
 _exchange_info_cache = {'ts': 0, 'data': None}  # exchange_info 캐시 (1시간)
+_pending_limit = {}   # {symbol: {order_id, qty, limit_px, sl, tp, placed_at, price_prec}}
 
 def log(msg):
     ts = datetime.now().strftime('%H:%M:%S')
@@ -202,76 +205,144 @@ def enter_position(client, signal):
         log(f"  {sym}: 수량 0 → 스킵")
         return False
 
-    # 시장가 진입
-    try:
-        order = client.futures_create_order(
-            symbol=sym, side='BUY', type='MARKET', quantity=str(qty)
-        )
-        log(f"  {sym}: MARKET BUY 체결 (ID: {order['orderId']})")
-    except Exception as e:
-        log(f"  {sym}: 진입 실패 — {e}")
-        return False
+    # 꼬리 저점 아래에 지정가 배치 (더 보수적 진입)
+    limit_px = round(signal['low'] * (1 - LIMIT_OFFSET_PCT / 100), price_prec)
 
-    # 체결가 확인
-    time.sleep(1)
-    pos = [p for p in client.futures_position_information(symbol=sym) if float(p['positionAmt']) != 0]
-    if not pos:
-        log(f"  {sym}: 체결 확인 실패")
-        return False
+    # 현재가보다 높으면 의미 없음 (이미 반등 완료) → 현재가 기준 재계산
+    if limit_px >= px:
+        limit_px = round(px * 0.998, price_prec)  # 현재가 -0.2%
 
-    ep = float(pos[0]['entryPrice'])
-
-    # SL = 꼬리 저점 - 버퍼 (레버리지 기준 실제 손실 5% 이내로 캡)
+    # SL/TP 미리 계산 (체결 시 배치)
     sl_wick = signal['low'] * (1 - SL_BUFFER_PCT / 100)
-    max_sl_1x = 5.0 / lev  # 실제 5% → 1x 기준
-    sl_cap = ep * (1 - max_sl_1x / 100)
-    sl = round(max(sl_wick, sl_cap), price_prec)  # 더 가까운(좁은) SL
+    max_sl_1x = 5.0 / lev
+    sl_cap = limit_px * (1 - max_sl_1x / 100)
+    sl = round(max(sl_wick, sl_cap), price_prec)
 
-    # TP = ATR 기반 또는 최소 (실제 5% 이상)
     atr = get_atr_1h(client, sym)
-    tp_atr = ep + atr * TP_ATR_MULT
-    tp_min = ep * (1 + TP_MIN_PCT / 100)
+    tp_atr = limit_px + atr * TP_ATR_MULT
+    tp_min = limit_px * (1 + TP_MIN_PCT / 100)
     tp = round(max(tp_atr, tp_min), price_prec)
 
-    # SL 배치
+    # 지정가 주문
     try:
-        client.futures_create_order(
-            symbol=sym, side='SELL', type='STOP_MARKET',
-            stopPrice=str(sl), closePosition='true'
+        order = client.futures_create_order(
+            symbol=sym, side='BUY', type='LIMIT',
+            price=str(limit_px), quantity=str(qty),
+            timeInForce='GTC'
         )
-        log(f"  SL: {sl} ({(sl - ep) / ep * 100:+.2f}%)")
+        order_id = order['orderId']
+        log(f"  {sym}: LIMIT BUY @ {limit_px} (꼬리저점 {signal['low']} 아래) ID={order_id}")
     except Exception as e:
-        log(f"  SL 실패: {e}")
+        log(f"  {sym}: 지정가 실패 — {e}")
+        return False
 
-    # TP 배치
-    try:
-        client.futures_create_order(
-            symbol=sym, side='SELL', type='TAKE_PROFIT_MARKET',
-            stopPrice=str(tp), closePosition='true'
-        )
-        log(f"  TP: {tp} ({(tp - ep) / ep * 100:+.2f}%)")
-    except Exception as e:
-        log(f"  TP 실패: {e}")
+    # 체결 대기 큐에 등록 (SL/TP는 체결 후 배치)
+    _pending_limit[sym] = {
+        'order_id': order_id,
+        'qty': qty,
+        'limit_px': limit_px,
+        'sl': sl,
+        'tp': tp,
+        'placed_at': time.time(),
+        'price_prec': price_prec,
+        'signal': signal,
+        'rsi': rsi,
+        'atr': atr,
+        'lev': lev,
+    }
 
-    # 상태 업데이트
-    _positions.add(sym)
     _cooldown[sym] = time.time() + COOLDOWN_SEC
 
-    sl_pct = (sl - ep) / ep * 100
-    tp_pct = (tp - ep) / ep * 100
+    sl_pct = (sl - limit_px) / limit_px * 100
+    tp_pct = (tp - limit_px) / limit_px * 100
 
-    # 텔레그램 알림
-    msg = (
-        f"<b>WICK REVERSAL</b>\n"
-        f"{sym} LONG @ ${ep:.2f}\n"
+    tg(
+        f"🕯️ <b>WICK LIMIT</b>\n"
+        f"{sym} LIMIT BUY @ ${limit_px:.2f} (꼬리저점 {signal['low']:.2f} 아래)\n"
         f"밑꼬리 {signal['wick_ratio']:.0%} | 낙폭 {signal['drop_pct']:.2f}% | 거래량 {signal['vol_ratio']:.1f}x\n"
-        f"SL: ${sl:.2f} ({sl_pct:+.2f}%)\n"
-        f"TP: ${tp:.2f} ({tp_pct:+.2f}%)\n"
-        f"RSI(15m): {rsi:.0f} | ATR: ${atr:.2f}"
+        f"체결 시 → SL ${sl:.2f} ({sl_pct:+.2f}%) TP ${tp:.2f} ({tp_pct:+.2f}%)\n"
+        f"RSI(15m): {rsi:.0f} | 5분 미체결 시 자동 취소"
     )
-    tg(msg)
-    log(f"  진입 완료: {sym} @ {ep} | SL {sl} | TP {tp}")
+    log(f"  대기: {sym} LIMIT @ {limit_px} | SL {sl} | TP {tp} | 5분 후 취소")
     return True
+
+
+def check_pending_limits(client):
+    """지정가 체결 확인 → SL/TP 배치 / 5분 미체결 → 취소"""
+    now = time.time()
+    done = []
+
+    for sym, info in list(_pending_limit.items()):
+        order_id = info['order_id']
+        elapsed = now - info['placed_at']
+
+        try:
+            order = client.futures_get_order(symbol=sym, orderId=order_id)
+            status = order['status']
+        except Exception as e:
+            log(f"  {sym}: 주문 조회 실패 — {e}")
+            if elapsed > LIMIT_EXPIRE_SEC:
+                done.append(sym)
+            continue
+
+        if status == 'FILLED':
+            # 체결! SL/TP 배치
+            ep = float(order['avgPrice']) or info['limit_px']
+            sl = info['sl']
+            tp = info['tp']
+            qty = info['qty']
+            price_prec = info['price_prec']
+
+            # 체결가 기준 SL/TP 재계산
+            sl_wick = info['signal']['low'] * (1 - SL_BUFFER_PCT / 100)
+            max_sl_1x = 5.0 / info['lev']
+            sl_cap = ep * (1 - max_sl_1x / 100)
+            sl = round(max(sl_wick, sl_cap), price_prec)
+            tp_atr = ep + info['atr'] * TP_ATR_MULT
+            tp_min = ep * (1 + TP_MIN_PCT / 100)
+            tp = round(max(tp_atr, tp_min), price_prec)
+
+            try:
+                client.futures_create_order(
+                    symbol=sym, side='SELL', type='STOP_MARKET',
+                    stopPrice=str(sl), closePosition='true')
+                log(f"  {sym}: 체결 @ {ep} → SL {sl}")
+            except Exception as e:
+                log(f"  {sym}: SL 배치 실패 — {e}")
+
+            try:
+                client.futures_create_order(
+                    symbol=sym, side='SELL', type='TAKE_PROFIT_MARKET',
+                    stopPrice=str(tp), closePosition='true')
+                log(f"  {sym}: TP {tp}")
+            except Exception as e:
+                log(f"  {sym}: TP 배치 실패 — {e}")
+
+            _positions.add(sym)
+            sl_pct = (sl - ep) / ep * 100
+            tp_pct = (tp - ep) / ep * 100
+            tg(
+                f"✅ <b>WICK 체결!</b>\n"
+                f"{sym} LONG @ ${ep:.2f}\n"
+                f"SL ${sl:.2f} ({sl_pct:+.2f}%) | TP ${tp:.2f} ({tp_pct:+.2f}%)"
+            )
+            done.append(sym)
+
+        elif status in ('CANCELED', 'EXPIRED', 'REJECTED'):
+            log(f"  {sym}: 주문 {status}")
+            done.append(sym)
+
+        elif elapsed > LIMIT_EXPIRE_SEC:
+            # 5분 초과 미체결 → 취소
+            try:
+                client.futures_cancel_order(symbol=sym, orderId=order_id)
+                log(f"  {sym}: {elapsed:.0f}초 미체결 → 취소")
+            except Exception as e:
+                log(f"  {sym}: 취소 실패 — {e}")
+            done.append(sym)
+
+    for sym in done:
+        _pending_limit.pop(sym, None)
 
 def check_exits(client):
     """포지션 청산 감지 → _positions 업데이트"""
@@ -307,7 +378,14 @@ def main():
             if cycle % 6 == 0:
                 check_exits(client)
 
+            # 지정가 체결 확인 (매 사이클)
+            if _pending_limit:
+                check_pending_limits(client)
+
             for sym in SYMBOLS:
+                # 이미 지정가 대기 중이면 스킵
+                if sym in _pending_limit:
+                    continue
                 signal = check_wick(client, sym)
                 if signal:
                     log(f"밑꼬리 감지! {sym} {signal['time']} | "

@@ -353,15 +353,15 @@ def run_grid_search(symbols):
     print(f"  그리드서치: {len(combos)}조합")
     print(f"{'='*70}")
 
-    # 데이터 한 번만 로드
-    print("데이터 로드 중...")
+    # 데이터 한 번만 로드 (14일 = 1000캔들)
+    print("14일 데이터 로드 중...")
     data_cache = {}
     btc_data = None
     for sym in symbols:
         if sym in BLACKLIST or sym == 'BTCUSDT':
             continue
         try:
-            df15 = get_klines(sym, '15m', 500)
+            df15 = get_klines(sym, '15m', 1000)
             df1h = get_klines(sym, '1h', 500)
             df4h = get_klines(sym, '4h', 200)
             if len(df15) < 100 or len(df1h) < 60 or len(df4h) < 30:
