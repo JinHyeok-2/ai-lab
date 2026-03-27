@@ -2102,8 +2102,12 @@ def _load_ensemble():
             "btc_seed100": base / "btc_seed100/ppo_btc_30m.zip",
             "btc_seed200": base / "btc_seed200/ppo_btc_30m.zip",
         }
-        # ALT 범용 모델 (14코인 학습, 롱전용 3-action)
-        alt_path = base / "alt_universal_exp01/ppo_alt.zip"
+        # ALT 앙상블 (exp01+seed200+seed700, 다수결, WF 38/40)
+        alt_paths = {
+            "alt_exp01": base / "alt_universal_exp01/ppo_alt.zip",
+            "alt_seed200": base / "alt_v2_seed200/ppo_alt.zip",
+            "alt_seed700": base / "alt_v2_seed700/ppo_alt.zip",
+        }
 
         result = {"eth": None, "btc": None, "alt": None}
         # ETH 로드
@@ -2120,12 +2124,19 @@ def _load_ensemble():
             add_log(f"✅ BTC RL 앙상블 로드 (exp14+seed100+seed200, 다수결)")
         else:
             add_log(f"⚠️ BTC RL 모델 누락")
-        # ALT 로드
-        if alt_path.exists():
-            result["alt"] = PPO.load(str(alt_path))
-            add_log(f"✅ ALT RL 범용모델 로드 (14코인 학습, 롱전용)")
+        # ALT 로드 (3모델 앙상블)
+        alt_ok = all(p.exists() for p in alt_paths.values())
+        if alt_ok:
+            result["alt"] = {k: PPO.load(str(p)) for k, p in alt_paths.items()}
+            add_log(f"✅ ALT RL 앙상블 로드 (exp01+seed200+seed700, 다수결, 26코인)")
         else:
-            add_log(f"⚠️ ALT RL 모델 누락")
+            # 폴백: 기존 단일 모델
+            _fb = base / "alt_universal_exp01/ppo_alt.zip"
+            if _fb.exists():
+                result["alt"] = {"alt_exp01": PPO.load(str(_fb))}
+                add_log(f"⚠️ ALT RL 단일모델 폴백 (앙상블 파일 누락)")
+            else:
+                add_log(f"⚠️ ALT RL 모델 누락")
         if not eth_ok and not btc_ok and result["alt"] is None:
             return None
         return result
@@ -2145,12 +2156,12 @@ def get_rl_signal(symbol: str) -> dict:
         if ensemble is None:
             return {"available": False, "reason": "앙상블 모델 파일 없음"}
 
-        # 알트코인 → 범용 모델 분기
+        # 알트코인 → 앙상블 분기
         is_alt = symbol not in ("ETHUSDT", "BTCUSDT")
         if is_alt:
-            alt_model = ensemble.get("alt")
-            if alt_model is None:
-                return {"available": False, "reason": "ALT 범용모델 미로드"}
+            alt_models = ensemble.get("alt")
+            if alt_models is None:
+                return {"available": False, "reason": "ALT 앙상블 미로드"}
         else:
             asset_key = "eth" if symbol == "ETHUSDT" else "btc"
             models = ensemble.get(asset_key)
@@ -2269,27 +2280,47 @@ def get_rl_signal(symbol: str) -> dict:
         # --- 모델 예측 + 투표 ---
         import torch as _torch
         if is_alt:
-            # ALT 범용 모델: 단일 모델 (0=관망, 1=롱, 2=청산) + action 확률
-            a, _ = alt_model.predict(obs, deterministic=True)
-            action = int(a)
-            # action probability 추출 → 확신도
-            try:
-                _obs_t = _torch.as_tensor(obs).unsqueeze(0).to(alt_model.device)
-                _dist = alt_model.policy.get_distribution(_obs_t)
-                _probs = _dist.distribution.probs.detach().cpu().numpy()[0]
-                action_prob = float(_probs[int(a)])  # 선택된 행동의 확률
-                long_prob = float(_probs[1])  # 롱 확률 (항상 추출)
-            except Exception:
-                action_prob, long_prob = 0.5, 0.0
-            # 알트 3-action → 표준 매핑: 2(청산)→3(청산)
+            # ALT 앙상블: 3모델 다수결 (0=관망, 1=롱, 2=청산)
+            alt_keys = list(alt_models.keys())
+            alt_votes = []
+            alt_long_probs = []
+            for k in alt_keys:
+                a, _ = alt_models[k].predict(obs, deterministic=True)
+                alt_votes.append(int(a))
+                # 롱 확률 추출
+                try:
+                    _obs_t = _torch.as_tensor(obs).unsqueeze(0).to(alt_models[k].device)
+                    _dist = alt_models[k].policy.get_distribution(_obs_t)
+                    _probs = _dist.distribution.probs.detach().cpu().numpy()[0]
+                    alt_long_probs.append(float(_probs[1]))
+                except Exception:
+                    alt_long_probs.append(0.0)
+
+            # 다수결 투표
+            vote_count = Counter(alt_votes)
+            maj = vote_count.most_common(1)[0]
+            if maj[1] >= 2:  # 2/3 이상 합의
+                action = maj[0]
+                method = "majority"
+            else:
+                action = 0  # 합의 없으면 관망
+                method = "no_consensus"
+
+            long_prob = float(np.mean(alt_long_probs))  # 평균 롱 확률
+            action_prob = maj[1] / len(alt_keys)  # 합의 비율
+
+            # 3-action → 표준 매핑: 2(청산)→3(청산)
+            raw_votes = alt_votes
             if action == 2:
                 action = 3
-            method = "single"
-            vote_str = f"[alt_universal:{int(a)}(p={action_prob:.0%})]"
-            raw_votes = [int(a)]
-            # 확률 기반 동적 보너스: 확신 70%+ → +5pt, 50~70% → +3pt, <50% → +1pt
+            vote_str = "[" + " ".join(f"{k}:{v}" for k, v in zip(alt_keys, alt_votes)) + "]"
+
+            # 앙상블 보너스: 만장일치 +5pt, 다수결 +3pt, 합의없음 0pt
             if action == 1:
-                confidence_bonus = 5 if action_prob >= 0.7 else (3 if action_prob >= 0.5 else 1)
+                if len(set(alt_votes)) == 1:  # 만장일치
+                    confidence_bonus = 5
+                else:
+                    confidence_bonus = 3  # 다수결
             else:
                 confidence_bonus = 0
         else:
@@ -5516,6 +5547,21 @@ if BINANCE_READY and st.session_state.get("alt_auto_scan", True):
             # DB 기록
             try:
                 _alt_reason = _pinfo.get("reason", "")
+                # RL 시그널 정보를 extra에 저장 (검증용)
+                import json as _json_ext
+                _rl_extra = {}
+                try:
+                    _rl_info = get_rl_signal(_psym)
+                    if _rl_info.get("available"):
+                        _rl_extra = {
+                            "rl_type": _rl_info.get("type", "wait"),
+                            "rl_votes": _rl_info.get("votes", ""),
+                            "rl_method": _rl_info.get("method", ""),
+                            "rl_long_prob": _rl_info.get("long_prob", 0),
+                            "rl_bonus": _rl_info.get("confidence_bonus", 0),
+                        }
+                except Exception:
+                    pass
                 _add_journal_entry({
                     "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "symbol": _psym,
@@ -5528,6 +5574,7 @@ if BINANCE_READY and st.session_state.get("alt_auto_scan", True):
                     "source": _pinfo.get("source", "alt_screener"),
                     "fill_price": _pinfo["entry_price"], "slippage": 0,
                     "entry_reason": _alt_reason,
+                    "extra": _json_ext.dumps(_rl_extra, ensure_ascii=False) if _rl_extra else None,
                 })
             except Exception:
                 pass
