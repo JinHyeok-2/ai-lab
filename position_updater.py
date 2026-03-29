@@ -5,11 +5,12 @@
 import sys
 sys.path.insert(0, '/home/hyeok/01.APCC/00.ai-lab')
 
+import os
 import time
 import math
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from binance_client import (get_klines, get_price, get_balance, get_positions,
                             get_client, place_sl_tp, _get_symbol_filters, _round_price,
                             set_margin_type, set_leverage)
@@ -25,24 +26,24 @@ import trade_db
 # ── 설정 ──
 INTERVAL = 300          # 5분
 MAX_ORDERS = 4          # 동시 최대 주문 수 (3→4, 분산 효과)
-ETH_USDT = 20           # ETH 진입금 (10→20)
-ALT_USDT = 20           # 알트 진입금 (8→20)
+ETH_USDT = 25           # ETH 진입금 (15→25, CVD 단독 운영 — 목표 $100)
+ALT_USDT = 25           # 알트 진입금 (15→25)
 ALT_USDT_MAX = 60       # 노셔널 상한 (ETH $20×3x=60, ALT $20×2x=40)
 ETH_LEV = 3             # ETH 레버리지
 ALT_LEV = 2             # 알트 레버리지
-MIN_SCORE = 5           # 최소 진입 점수 (3→5 상향: 신뢰도 3~4 노이즈 제거)
+MIN_SCORE = 6           # 최소 진입 점수 (5→6: 그리드서치 1위, 노이즈 제거 강화)
 MAX_SL_PCT = 5.0        # SL 최대 거리 (%)
 MAX_LOSS_PER_TRADE = 1.0  # #141 건당 최대 손실 캡 $1.0 (수량 조절 방식)
 MAX_SAME_DIR = 4        # 동일 방향 최대 (2→4, 롱전용이므로 MAX_ORDERS와 동일)
-MAX_DAILY_TRADES = 8    # 하루 최대 거래 횟수 (5→8, 감지기 추가로 기회 증가)
-NIGHT_HOURS = {0, 1, 2, 3, 4, 22, 23}  # #H: 야간 진입 차단 확대 (22~04시 KST, 밤새 보유→아침 손절 방지)
+MAX_DAILY_TRADES = 5    # 하루 최대 거래 횟수 (8→5, 15건 이하 수익 구간)
+NIGHT_HOURS = {0, 1, 2, 3, 4, 21, 22, 23}  # #H: 야간 진입 차단 확대 (21~04시 KST, 21시 6건전패 반영)
 BLACKLIST = {'BRUSDT', 'SIRENUSDT', 'XAUUSDT', 'XAGUSDT', 'RIVERUSDT', 'SIGNUSDT', 'PAXGUSDT'}  # 반복 손실/극단 변동성/TradFi 미서명/지표역행/ADX극단/0%승률
 TG_TOKEN = TELEGRAM_TOKEN
 TG_CHAT  = TELEGRAM_CHAT_ID
 
 # 스캔 대상 (ETH 고정 + 거래량 상위 동적 선택)
 SCAN_FIXED = ['ETHUSDT']  # 항상 포함
-SCAN_ALT_COUNT = 25       # 알트 동적 선택 수 (15→25, 더 많은 기회 포착)
+SCAN_ALT_COUNT = 30       # 알트 동적 선택 수 (25→30, CVD 중형 종목 기회 확대)
 _scan_cache = {'ts': 0, 'symbols': []}
 
 LOG_PATH = '/home/hyeok/01.APCC/00.ai-lab/position_updater.log'
@@ -99,6 +100,24 @@ _bear_stopped = False  # 하락장 당일 거래 정지 플래그
 # 최소 보유시간 (10분 미만 트레일링 청산 방지)
 MIN_HOLD_SEC = 600  # 10분
 _entry_time = {}  # {symbol: time.time()}
+_entry_source = {}  # {symbol: 'cvd_divergence' 등} — 전략별 보유시간 차등
+
+# ── 기관 매매법 전략 변수 ──
+# #L: CVD 다이버전스
+_cvd_cache = {'ts': 0}  # 10분 캐시
+CVD_LOG = '/home/hyeok/01.APCC/00.ai-lab/cvd_signals.jsonl'
+# #M: OI + 롱숏비율 콤보 (숏 스퀴즈)
+_squeeze_cache = {'ts': 0}
+SQUEEZE_LOG = '/home/hyeok/01.APCC/00.ai-lab/squeeze_signals.jsonl'
+# #N: MTF 컨플루언스 (멀티 타임프레임 과매도)
+_mtf_cache = {'ts': 0}
+MTF_LOG = '/home/hyeok/01.APCC/00.ai-lab/mtf_signals.jsonl'
+# #O: VWAP 평균회귀
+_vwap_cache = {'ts': 0}
+VWAP_LOG = '/home/hyeok/01.APCC/00.ai-lab/vwap_signals.jsonl'
+# #P: 거래량 프로파일 (POC)
+_vpoc_cache = {'ts': 0}
+VPOC_LOG = '/home/hyeok/01.APCC/00.ai-lab/vpoc_signals.jsonl'
 
 
 def log(msg):
@@ -432,7 +451,7 @@ def score_symbol(symbol):
 
             # 알트 4h 수익률 (이미 로드한 1h 데이터의 close에서 계산)
             _alt_close_now = i1h.get('close', px) or px
-            _alt_closes = []
+            pass  # 미사용 _alt_closes 제거
             try:
                 _df1h = get_klines(symbol, '1h', 6)
                 if len(_df1h) >= 5:
@@ -502,6 +521,36 @@ def score_symbol(symbol):
                 # 거래량 절반 이하 → 가짜 움직임, 감점
                 score = int(score * 0.7)
 
+        # #Q: 연속 음봉 필터 (4+ 음봉 = 떨어지는 칼날 → 감점)
+        try:
+            _klines_1h = get_klines(symbol, '1h', 12)
+            _closes_1h = _klines_1h['close'].astype(float).tolist() if 'close' in _klines_1h.columns else []
+            _consecutive_red = 0
+            for _ci in range(len(_closes_1h)-1, 0, -1):
+                if _closes_1h[_ci] < _closes_1h[_ci-1]:
+                    _consecutive_red += 1
+                else:
+                    break
+            if _consecutive_red >= 4:
+                score -= 5  # 떨어지는 칼날 차단 (0% 승률)
+            elif _consecutive_red >= 3:
+                score -= 2
+
+            # #R: 거래량 급증 + 레인지 상단 = 고점 진입 차단
+            _highs_1h = _klines_1h['high'].astype(float).tolist() if 'high' in _klines_1h.columns else []
+            _lows_1h = _klines_1h['low'].astype(float).tolist() if 'low' in _klines_1h.columns else []
+            if _highs_1h and _lows_1h:
+                _range_h = max(_highs_1h)
+                _range_l = min(_lows_1h)
+                _range_pct = (px - _range_l) / (_range_h - _range_l) * 100 if _range_h != _range_l else 50
+                _vol_1h = i1h.get('volume', 0) or 0
+                _vol_avg_1h = i1h.get('vol_ma20', 0) or 0
+                _vol_ratio_1h = _vol_1h / _vol_avg_1h if _vol_avg_1h else 1
+                if _vol_ratio_1h > 2.0 and _range_pct > 60:
+                    score -= 3  # 고점+거래량급증 = 패닉/FOMO 진입 차단
+        except:
+            pass
+
         # 하락추세 종목 필터 (4h 역배열 + 1h RSI 약세 → 롱 차단)
         e20_4h = i4h.get('ema20', 0) or 0
         e50_4h = i4h.get('ema50', 0) or 0
@@ -519,17 +568,26 @@ def score_symbol(symbol):
             except:
                 pass
 
-        # #3: TAO 가중치 강화 (11전 11승 유일 무패 → +3 보너스)
+        # #3: TAO — 하락장에서 완전 차단 (19건 58% -$2.64 반복손실)
         if symbol == 'TAOUSDT':
-            score += 3
+            if _bear_mode:
+                score -= 10  # 하락장 TAO 완전 차단
+            else:
+                score += 3  # 상승/일반장에서만 보너스
 
         # 방향 — 롱 전용
         # #B: 12-15시 점수 +2 상향 (7건 승률29% 최악 구간)
         _hour = datetime.now().hour
-        _min_score = MIN_SCORE + 2 if 12 <= _hour < 15 else MIN_SCORE
+        _min_score = MIN_SCORE  # 그리드서치: 12-15시 보너스 0이 최적
         # 상승장: MIN_SCORE -1 (더 쉽게 진입)
         if _bull_mode:
             _min_score = max(_min_score - 1, 3)
+        # ETH: 3건 33% -$1.46 → MIN_SCORE +1 강화
+        if symbol == 'ETHUSDT':
+            _min_score += 1
+        # 화요일: 20건 패평균-$1.71 최악 요일 → MIN_SCORE +1
+        if datetime.now().weekday() == 1:  # 0=월, 1=화
+            _min_score += 1
         if score >= _min_score: direction = 'long'
         else: direction = 'wait'
 
@@ -601,7 +659,7 @@ def calc_entry(a):
         elif atr_pct >= 2.0:  # 중변동 (TAO, FET 등) — 기본
             sl_m, tp_m = 2.0, 5.0
         else:                 # 저변동 (BNB, SOL 등)
-            sl_m, tp_m = 1.5, 3.5  # SL 좁게, TP도 좁게
+            sl_m, tp_m = 2.0, 5.0  # 그리드서치: SL2.0 TP5.0 통일
 
     # 시장 모드별 TP 조절
     if _bear_mode:
@@ -809,8 +867,11 @@ def check_fills():
                                 sl_price=info['sl'], tp_price=info['tp'])
                     _sltp_done.add(sym)
                     _tp_cache[sym] = info['tp']
-                    _daily_trades['count'] += 1
-                    _entry_time[sym] = time.time()  # 최소 보유시간 추적
+                    # 기관 전략은 _institutional_post_entry에서 이미 카운트 → updater만 여기서 증가
+                    if info.get('source', 'updater') == 'updater':
+                        _daily_trades['count'] += 1
+                    _entry_time[sym] = time.time()
+                    _entry_source[sym] = info.get('source', 'updater')
                     log(f"  ✅ {sym} 체결! SL/TP 배치 (SL ${info['sl']}, TP ${info['tp']}) [오늘 {_daily_trades['count']}/{MAX_DAILY_TRADES}건]")
                     # DB 기록
                     try:
@@ -839,6 +900,17 @@ def check_fills():
     for sym in filled:
         del _pending_fills[sym]
 
+    # 1-2. 만료된 pending 주문 정리 (기관 전략 300초 TTL)
+    expired = [s for s, info in _pending_fills.items()
+               if info.get('expire') and time.time() > info['expire'] and not has_position(s)]
+    for sym in expired:
+        try:
+            client = get_client()
+            client.futures_cancel_all_open_orders(symbol=sym)
+            log(f"  ⏰ {sym} 미체결 만료 → 주문 취소")
+        except: pass
+        del _pending_fills[sym]
+
     # 2. 포지션 보유 중인데 SL/TP 추적 안 된 종목 보완 (재시작 시 1회만)
     try:
         client = get_client()
@@ -853,7 +925,6 @@ def check_fills():
                 # 이미 SL/TP 배치 시도 → 스킵 (#D1 — algo 주문은 get_open_orders에서 안 보임)
                 # 한 번 배치 시도하면 _sltp_done에 추가하여 재시도 방지
                 # 실제로 algo로 걸려 있으므로 1회만 시도하면 충분
-                _try_sl_tp = True
                 try:
                     existing = client.futures_get_open_orders(symbol=sym)
                     has_sl = any(o['type'] in ('STOP_MARKET', 'STOP') for o in existing)
@@ -870,8 +941,8 @@ def check_fills():
                 if atr > 0:
                     is_long = 'LONG' in side_str.upper()
                     lev = 3 if sym == 'ETHUSDT' else 2
-                    sl_m = 1.5
-                    tp_m = 3.0 if sym == 'ETHUSDT' else 3.5
+                    sl_m = 2.0  # 그리드서치 최적값
+                    tp_m = 5.0  # 그리드서치 최적값
                     sl = round(entry - atr * sl_m, 6) if is_long else round(entry + atr * sl_m, 6)
                     tp = round(entry + atr * tp_m, 6) if is_long else round(entry - atr * tp_m, 6)
                     close_side = 'SELL' if is_long else 'BUY'
@@ -1033,9 +1104,20 @@ def _update_sl_on_exchange(client, sym, new_sl, entry, lev, is_long):
             symbol=sym, side=close_side, type='STOP_MARKET',
             stopPrice=str(new_sl), quantity=str(_qty), reduceOnly=True
         )
-        # TP 재배치 (캐시에서)
-        if sym in _tp_cache:
-            _tp_str = str(round(_tp_cache[sym], 2 if new_sl > 100 else (4 if new_sl > 1 else 6)))
+        # TP 재배치 (캐시 또는 ATR 기반 재계산)
+        _tp_val = _tp_cache.get(sym)
+        if not _tp_val:
+            # 캐시 없으면 ATR 기반 재계산
+            try:
+                _i1h = calc_indicators(get_klines(sym, '1h', 60))
+                _atr = _i1h.get('atr', 0) or 0
+                _entry = float(_pos[0]['entryPrice'])
+                if _atr > 0:
+                    _tp_val = _entry + _atr * 5.0 if is_long else _entry - _atr * 5.0
+                    _tp_cache[sym] = _tp_val
+            except: pass
+        if _tp_val:
+            _tp_str = str(round(_tp_val, 2 if _tp_val > 100 else (4 if _tp_val > 1 else 6)))
             try:
                 client.futures_create_order(
                     symbol=sym, side=close_side, type='TAKE_PROFIT_MARKET',
@@ -1247,9 +1329,10 @@ def check_long_hold():
             if not is_long:
                 continue
 
-            # #I: 보유시간 확인 (8h→4h 단축, 장기보유 손실 방지)
+            # #I: 보유시간 확인 (하락장 2h / 일반 4h)
             held_sec = now - _entry_time.get(sym, now)
-            if held_sec < 4 * 3600:  # 4시간 미만 스킵
+            hold_limit = 2 * 3600 if _bear_mode else 4 * 3600
+            if held_sec < hold_limit:
                 continue
 
             held_h = held_sec / 3600
@@ -1275,6 +1358,13 @@ def check_long_hold():
             elif e20_1h < e50_1h and rsi1h < 35:
                 trend_broken = True
                 reason = f"1h 역배열 + RSI {rsi1h:.0f}"
+
+            # #T: 강제 청산 — CVD는 12h (기관 매집 후 천천히 상승), 나머지 6h
+            _source = _entry_source.get(sym, 'updater')
+            _max_hold = 12 * 3600 if _source == 'cvd_divergence' else 6 * 3600
+            if held_sec >= _max_hold:
+                trend_broken = True
+                reason = f"{_max_hold//3600}h+ 강제 ({held_h:.1f}h)"
 
             if not trend_broken:
                 continue
@@ -2197,7 +2287,7 @@ def check_listing_short():
 
                 # 1h 캔들로 급등 확인
                 k1h = get_klines(sym, '1h', 6)
-                closes_1h = [float(k[4]) for k in k1h]
+                closes_1h = k1h['close'].astype(float).tolist()
                 if len(closes_1h) < 3:
                     continue
                 pct_3h = (closes_1h[-1] - closes_1h[-3]) / closes_1h[-3] * 100
@@ -2326,6 +2416,787 @@ def check_listing_short():
         log(f"  상장 숏 오류: {e}")
 
 
+# ═══════════════════════════════════════════════════════════
+# 기관 매매법 전략 #L~#P (데이터 로깅 + 조건부 진입)
+# ═══════════════════════════════════════════════════════════
+
+def _institutional_guard():
+    """기관 전략 공통 가드 — 야간/일일한도 체크 (updater와 한도 통합)"""
+    kst_hour = (datetime.now(tz=timezone.utc).hour + 9) % 24
+    if kst_hour in NIGHT_HOURS:
+        return False, "야간"
+    # 일일 한도: updater + 기관 전략 통합 카운트
+    today = datetime.now().strftime('%Y-%m-%d')
+    if _daily_trades.get('date') == today and _daily_trades.get('count', 0) >= MAX_DAILY_TRADES:
+        return False, "일일 한도"
+    return True, ""
+
+
+def _check_already_held(sym):
+    """같은 종목 다전략 진입 차단 — 포지션 or pending 있으면 True"""
+    if has_position(sym):
+        return True
+    if sym in _pending_fills:
+        return True
+    return False
+
+
+def _institutional_entry_usdt(bear_mult=0.6, normal_mult=0.7, min_usdt=12):
+    """기관 전략 공통 진입금 계산 — 노셔널 보장"""
+    usdt = ALT_USDT * (bear_mult if _bear_mode else normal_mult)
+    return max(usdt, min_usdt)
+
+
+def _institutional_post_entry(sym, source):
+    """기관 전략 진입 후 공통 처리 — 일일 카운트 + 쿨다운"""
+    today = datetime.now().strftime('%Y-%m-%d')
+    if _daily_trades.get('date') != today:
+        _daily_trades['date'] = today
+        _daily_trades['count'] = 0
+    _daily_trades['count'] += 1
+    _cooldown[sym] = time.time() + COOLDOWN_SEC
+
+def check_cvd_divergence():
+    """
+    #L: CVD 다이버전스 — 가격 저점 갱신 but 매수 누적 증가 = 기관 매집
+    Binance 캔들의 taker buy volume으로 CVD 계산
+    """
+    global _cvd_cache
+    now = time.time()
+    if now - _cvd_cache['ts'] < 600:  # 10분 캐시
+        return
+    _cvd_cache['ts'] = now
+
+    ok, reason = _institutional_guard()
+    if not ok:
+        return
+
+    try:
+        client = get_client()
+        held = get_held_symbols()
+        if len(held) >= MAX_ORDERS:
+            return
+
+        # #5: BTC 하락 중이면 알트 CVD 무시 (BTC 1h RSI < 30 = 강한 하락)
+        _btc_rsi_1h = _btc_cache.get('rsi', 50)
+        if _btc_rsi_1h < 30:
+            return
+
+        # 스캔 대상: ETH + 상위 알트 (SOL 제외 — 4건 25% -$0.39)
+        _cvd_exclude = {'SOLUSDT'}
+        symbols = [s for s in get_scan_universe() if s not in _cvd_exclude]
+        signals = []
+
+        for sym in symbols:
+            if sym in held or sym in BLACKLIST:
+                continue
+            if sym in _cooldown and time.time() < _cooldown[sym]:
+                continue
+
+            try:
+                # 1h 캔들 48개 (taker buy volume 포함)
+                k = client.futures_klines(symbol=sym, interval='1h', limit=48)
+                if len(k) < 30:
+                    continue
+
+                closes = [float(x[4]) for x in k]
+                volumes = [float(x[5]) for x in k]
+                taker_buy_vol = [float(x[9]) for x in k]  # taker buy base vol
+
+                # CVD 계산: 매수량 - 매도량 누적
+                cvd = []
+                cum = 0
+                for i in range(len(k)):
+                    buy_v = taker_buy_vol[i]
+                    sell_v = volumes[i] - buy_v
+                    cum += (buy_v - sell_v)
+                    cvd.append(cum)
+
+                # 최근 12시간 내 가격 저점 vs CVD 저점 비교
+                recent_closes = closes[-12:]
+                recent_cvd = cvd[-12:]
+
+                px = closes[-1]
+                cvd_now = cvd[-1]
+                cvd_12h_low = min(recent_cvd)
+                price_12h_low = min(recent_closes)
+
+                # 조건: 현재가가 12h 저점 근처 (-2% ~ +1%) + CVD 저점 대비 상승
+                _low_dist = (px - price_12h_low) / price_12h_low if price_12h_low > 0 else 999
+                near_low = -0.02 < _low_dist < 0.01  # 저점 아래 2%까지만 허용
+
+                # CVD 상승 판정: 저점 대비 5% 회복
+                if cvd_12h_low < 0:
+                    cvd_rising = cvd_now > cvd_12h_low * 0.95  # 음수: -100→-95 = 5% 회복
+                elif cvd_12h_low > 0:
+                    cvd_rising = cvd_now > cvd_12h_low * 1.05  # 양수: 100→105 = 5% 증가
+                else:
+                    cvd_rising = cvd_now > 0
+
+                # RSI 필터
+                ind = calc_indicators(get_klines(sym, '1h', 50))
+                rsi = ind.get('rsi', 50) or 50
+                atr = ind.get('atr', 0) or 0  # ATR도 여기서 가져옴 (진입 시 재사용)
+
+                # CVD 추세 확인: 최근 3캔들 CVD 연속 상승 (노이즈 방지)
+                cvd_trend_up = cvd[-1] > cvd[-2] > cvd[-3]
+
+                is_signal = near_low and cvd_rising and cvd_trend_up and rsi < 35
+
+                # 로그 (조건 부분 충족이라도 기록)
+                if near_low or (rsi < 35 and cvd_rising):
+                    try:
+                        with open(CVD_LOG, 'a') as f:
+                            f.write(json.dumps({
+                                "time": datetime.now().strftime('%Y-%m-%d %H:%M'),
+                                "symbol": sym, "price": px,
+                                "cvd_now": round(cvd_now, 2),
+                                "cvd_12h_low": round(cvd_12h_low, 2),
+                                "rsi": round(rsi), "near_low": near_low,
+                                "cvd_rising": cvd_rising,
+                                "signal": is_signal, "cvd_trend_up": cvd_trend_up,
+                                "entered": False,
+                            }) + '\n')
+                    except:
+                        pass
+
+                if is_signal:
+                    # cvd_delta를 % 정규화 (거래량 큰 종목 편향 방지)
+                    _cvd_delta_pct = abs(cvd_now - cvd_12h_low) / abs(cvd_12h_low) * 100 if cvd_12h_low != 0 else 0
+                    signals.append({
+                        'symbol': sym, 'price': px, 'rsi': rsi,
+                        'cvd_delta': round(_cvd_delta_pct, 1),
+                        'atr': atr,  # 진입 시 재사용
+                    })
+
+            except Exception as _e:
+                log(f"  ⚠️ CVD {sym} 스캔 오류: {str(_e)[:60]}")
+                continue
+
+        # 가장 강한 시그�� 1개 진입
+        if signals and len(held) < MAX_ORDERS:
+            # RSI 가장 낮고 CVD 델타 가장 큰 것 (복합 점수)
+            best = sorted(signals, key=lambda x: x['rsi'] - x['cvd_delta'] * 0.1)[0]
+            sym = best['symbol']
+            if _check_already_held(sym):
+                return
+            log(f"  📊 CVD 다이��전스 감지: {sym} RSI={best['rsi']:.0f} CVD↑{best['cvd_delta']}%")
+
+            # CVD 전용 ���입금 — $25 기본, 하락장 70%
+            usdt = max(ALT_USDT * (0.7 if _bear_mode else 1.0), 12)
+            lev = ETH_LEV if sym == 'ETHUSDT' else ALT_LEV
+            try:
+                set_margin_type(sym, "ISOLATED")
+                set_leverage(sym, lev)
+                px = float(get_price(sym))
+                limit_px = _round_price_sym(sym, px * 0.995)  # 0.5% 아래 지정가
+
+                qty = _round_qty(sym, usdt * lev / px)
+                # 노셔널 $20 최소 보장 (LIMIT 가격 기준)
+                if qty <= 0 or qty * limit_px < 20:
+                    step, _ = _get_symbol_filters(sym)
+                    qty = _round_qty(sym, 21.0 / limit_px + float(step))
+                if qty <= 0:
+                    return
+
+                # ATR: 시그널 스캔���서 이미 계산한 값 재사용
+                atr = best.get('atr', 0) or 0
+                if atr <= 0:
+                    _ind = calc_indicators(get_klines(sym, '1h', 50))
+                    atr = _ind.get('atr', 0) or 0
+                atr_pct = atr / px * 100 if px else 1
+
+                sl_pct = max(atr_pct * 1.5, 2.0 / lev)
+                tp_pct = max(atr_pct * 5.0, sl_pct * 3.3)
+                sl = _round_price_sym(sym, limit_px * (1 - sl_pct / 100))  # SL/TP도 LIMIT 가격 기준
+                tp = _round_price_sym(sym, limit_px * (1 + tp_pct / 100))
+
+                order = client.futures_create_order(
+                    symbol=sym, side='BUY', type='LIMIT',
+                    price=str(limit_px),
+                    quantity=str(qty), timeInForce='GTC'
+                )
+                _pending_fills[sym] = {
+                    'order_id': order['orderId'], 'sl': sl, 'tp': tp,
+                    'side': 'BUY', 'entry': limit_px, 'score': 0, 'atr': atr,
+                    'time': time.time(), 'source': 'cvd_divergence',
+                    'expire': time.time() + 300,
+                }
+                trade_db.add_trade({"symbol": sym, "side": "🟢 롱", "action": "진입",
+                                    "qty": qty, "price": px, "sl": sl, "tp": tp,
+                                    "source": "cvd_divergence",
+                                    "extra": json.dumps({"rsi": round(best['rsi']), "cvd_delta": best['cvd_delta']})})
+                log(f"  ✅ CVD 롱 진입: {sym} ${usdt:.0f} SL={sl} TP={tp}")
+                send_message(TG_TOKEN, TG_CHAT, f"📊 CVD 다이버전스 롱\n{sym} RSI={best['rsi']:.0f}\nSL={sl} TP={tp}")
+                _institutional_post_entry(sym, 'cvd_divergence')
+            except Exception as e:
+                log(f"  ❌ CVD 진입 실패: {e}")
+
+    except Exception as e:
+        log(f"  CVD 오류: {e}")
+
+
+def check_short_squeeze():
+    """
+    #M: OI 증가 + 롱숏비율 극단 = 숏 스퀴즈 감지
+    Binance API: futures_top_longshort_account_ratio + futures_open_interest_hist
+    """
+    global _squeeze_cache
+    now = time.time()
+    if now - _squeeze_cache['ts'] < 600:  # 10분 캐시
+        return
+    _squeeze_cache['ts'] = now
+
+    ok, reason = _institutional_guard()
+    if not ok:
+        return
+
+    try:
+        client = get_client()
+        held = get_held_symbols()
+        if len(held) >= MAX_ORDERS:
+            return
+
+        symbols = get_scan_universe()
+        signals = []
+
+        for sym in symbols:
+            if sym in held or sym in BLACKLIST:
+                continue
+            if sym in _cooldown and time.time() < _cooldown[sym]:
+                continue
+
+            try:
+                # 롱숏 비율 (상위 트레이더 계정 기준)
+                ls = client.futures_top_longshort_account_ratio(symbol=sym, period='1h', limit=4)
+                if not ls:
+                    continue
+                latest_ratio = float(ls[-1]['longShortRatio'])  # <1이면 숏 우세
+
+                # OI 변화 (4시간)
+                oi_hist = client.futures_open_interest_hist(symbol=sym, period='1h', limit=4)
+                if len(oi_hist) < 4:
+                    continue
+                oi_now = float(oi_hist[-1]['sumOpenInterestValue'])
+                oi_4h = float(oi_hist[0]['sumOpenInterestValue'])
+                oi_change = (oi_now - oi_4h) / oi_4h * 100 if oi_4h else 0
+
+                # RSI
+                df = get_klines(sym, '1h', 50)
+                ind = calc_indicators(df)
+                rsi = ind.get('rsi', 50) or 50
+                px = float(get_price(sym))
+
+                # 숏 스퀴즈 조건: 숏 과밀(ratio<0.8) + OI 증가(+1.5%+) + RSI<40
+                is_squeeze = latest_ratio < 0.8 and oi_change > 1.5 and rsi < 40
+
+                # 로그 (ratio<1이면 기록)
+                if latest_ratio < 1.0 or oi_change > 3:
+                    try:
+                        with open(SQUEEZE_LOG, 'a') as f:
+                            f.write(json.dumps({
+                                "time": datetime.now().strftime('%Y-%m-%d %H:%M'),
+                                "symbol": sym, "price": px,
+                                "ls_ratio": round(latest_ratio, 3),
+                                "oi_change_4h": round(oi_change, 2),
+                                "rsi": round(rsi),
+                                "signal": is_squeeze,
+                            }) + '\n')
+                    except:
+                        pass
+
+                if is_squeeze:
+                    signals.append({
+                        'symbol': sym, 'price': px, 'rsi': rsi,
+                        'ls_ratio': latest_ratio, 'oi_change': oi_change,
+                    })
+
+            except:
+                continue
+
+        # 가장 강한 스퀴즈 1개 진입
+        if signals and len(held) < MAX_ORDERS:
+            best = sorted(signals, key=lambda x: x['ls_ratio'])[0]
+            sym = best['symbol']
+            if _check_already_held(sym):
+                return
+            log(f"  🔥 숏 스퀴즈 감지: {sym} 롱숏={best['ls_ratio']:.2f} OI+{best['oi_change']:.1f}% RSI={best['rsi']:.0f}")
+
+            usdt = max(ALT_USDT * (0.6 if _bear_mode else 0.7), 12)
+            lev = ETH_LEV if sym == 'ETHUSDT' else ALT_LEV
+            try:
+                set_margin_type(sym, "ISOLATED")
+                set_leverage(sym, lev)
+                px = float(get_price(sym))
+                qty = _round_qty(sym, usdt * lev / px)
+                if qty <= 0 or qty * px < 5:
+                    return
+
+                df = get_klines(sym, '1h', 50)
+                ind = calc_indicators(df)
+                atr = ind.get('atr', 0) or 0
+                atr_pct = atr / px * 100 if px else 1
+
+                sl_pct = max(atr_pct * 1.5, 2.0 / lev)
+                tp_pct = max(atr_pct * 3.5, sl_pct * 2.5)
+                sl = _round_price_sym(sym, px * (1 - sl_pct / 100))
+                tp = _round_price_sym(sym, px * (1 + tp_pct / 100))
+
+                order = client.futures_create_order(
+                    symbol=sym, side='BUY', type='LIMIT',
+                    price=str(_round_price_sym(sym, px * 0.999)),
+                    quantity=str(qty), timeInForce='GTC'
+                )
+                _pending_fills[sym] = {
+                    'order_id': order['orderId'], 'sl': sl, 'tp': tp,
+                    'side': 'BUY', 'entry': px, 'score': 0, 'atr': atr,
+                    'time': time.time(), 'source': 'short_squeeze',
+                    'expire': time.time() + 300,
+                }
+                trade_db.add_trade({"symbol": sym, "side": "🟢 롱", "action": "진입",
+                                    "qty": qty, "price": px, "sl": sl, "tp": tp,
+                                    "source": "short_squeeze",
+                                    "extra": json.dumps({"ls_ratio": best['ls_ratio'], "oi_change": round(best['oi_change'], 1)})})
+                log(f"  ✅ 스퀴즈 롱: {sym} ${usdt:.0f} SL={sl} TP={tp}")
+                send_message(TG_TOKEN, TG_CHAT, f"🔥 숏 스퀴즈 롱\n{sym} 롱숏={best['ls_ratio']:.2f}\nOI+{best['oi_change']:.1f}%\nSL={sl} TP={tp}")
+                _institutional_post_entry(sym, 'short_squeeze')
+            except Exception as e:
+                log(f"  ❌ 스퀴즈 진입 실패: {e}")
+
+    except Exception as e:
+        log(f"  스퀴즈 오류: {e}")
+
+
+def check_mtf_confluence():
+    """
+    #N: 멀티 타임프레임 컨플루언스 — 4h+1h+15m 동시 과매도 = 강력 반등
+    조건 까다로워서 빈도 낮지만 승률 높음
+    """
+    global _mtf_cache
+    now = time.time()
+    if now - _mtf_cache['ts'] < 600:  # 10분 캐시
+        return
+    _mtf_cache['ts'] = now
+
+    ok, reason = _institutional_guard()
+    if not ok:
+        return
+
+    try:
+        client = get_client()
+        held = get_held_symbols()
+        if len(held) >= MAX_ORDERS:
+            return
+
+        symbols = get_scan_universe()
+        signals = []
+
+        for sym in symbols:
+            if sym in held or sym in BLACKLIST:
+                continue
+            if sym in _cooldown and time.time() < _cooldown[sym]:
+                continue
+
+            try:
+                # 3개 타임프레임 지표
+                i15 = calc_indicators(get_klines(sym, '15m', 50))
+                i1h = calc_indicators(get_klines(sym, '1h', 50))
+                i4h = calc_indicators(get_klines(sym, '4h', 50))
+
+                rsi15 = i15.get('rsi', 50) or 50
+                rsi1h = i1h.get('rsi', 50) or 50
+                rsi4h = i4h.get('rsi', 50) or 50
+
+                bb_lower = i1h.get('bb_lower', 0) or 0
+                px = float(get_price(sym))
+
+                # 볼린저 하단 이탈
+                below_bb = px < bb_lower if bb_lower else False
+
+                # 컨플루언스: 모든 TF 과매도
+                # MTF 조건 완화: 4h<35 + 1h<30 + 15m<25 + BB하단
+                is_signal = rsi4h < 35 and rsi1h < 30 and rsi15 < 25 and below_bb
+
+                # 로그 (2개 이상 과매도면 기록)
+                oversold_count = (1 if rsi4h < 35 else 0) + (1 if rsi1h < 30 else 0) + (1 if rsi15 < 25 else 0)
+                if oversold_count >= 2:
+                    try:
+                        with open(MTF_LOG, 'a') as f:
+                            f.write(json.dumps({
+                                "time": datetime.now().strftime('%Y-%m-%d %H:%M'),
+                                "symbol": sym, "price": px,
+                                "rsi_4h": round(rsi4h), "rsi_1h": round(rsi1h),
+                                "rsi_15m": round(rsi15), "below_bb": below_bb,
+                                "oversold_count": oversold_count,
+                                "signal": is_signal,
+                            }) + '\n')
+                    except:
+                        pass
+
+                if is_signal:
+                    signals.append({
+                        'symbol': sym, 'price': px,
+                        'rsi4h': rsi4h, 'rsi1h': rsi1h, 'rsi15': rsi15,
+                    })
+
+            except:
+                continue
+
+        # 가장 과매도인 것 1개 진입
+        if signals and len(held) < MAX_ORDERS:
+            best = sorted(signals, key=lambda x: x['rsi1h'])[0]
+            sym = best['symbol']
+            if _check_already_held(sym):
+                return
+            log(f"  🎯 MTF 컨플루언스: {sym} RSI 4h={best['rsi4h']:.0f} 1h={best['rsi1h']:.0f} 15m={best['rsi15']:.0f}")
+
+            usdt = max(ALT_USDT * 0.8, 12)  # MTF는 고승률이라 좀 더
+            lev = ETH_LEV if sym == 'ETHUSDT' else ALT_LEV
+            try:
+                set_margin_type(sym, "ISOLATED")
+                set_leverage(sym, lev)
+                px = float(get_price(sym))
+                qty = _round_qty(sym, usdt * lev / px)
+                if qty <= 0 or qty * px < 5:
+                    return
+
+                atr = (calc_indicators(get_klines(sym, '1h', 50)).get('atr', 0) or 0)
+                atr_pct = atr / px * 100 if px else 1
+                sl_pct = max(atr_pct * 1.2, 1.5 / lev)
+                tp_pct = max(atr_pct * 3.0, sl_pct * 2.5)
+                sl = _round_price_sym(sym, px * (1 - sl_pct / 100))
+                tp = _round_price_sym(sym, px * (1 + tp_pct / 100))
+
+                order = client.futures_create_order(
+                    symbol=sym, side='BUY', type='LIMIT',
+                    price=str(_round_price_sym(sym, px * 0.999)),
+                    quantity=str(qty), timeInForce='GTC'
+                )
+                _pending_fills[sym] = {
+                    'order_id': order['orderId'], 'sl': sl, 'tp': tp,
+                    'side': 'BUY', 'entry': px, 'score': 0, 'atr': atr,
+                    'time': time.time(), 'source': 'mtf_confluence',
+                    'expire': time.time() + 300,
+                }
+                trade_db.add_trade({"symbol": sym, "side": "🟢 롱", "action": "진입",
+                                    "qty": qty, "price": px, "sl": sl, "tp": tp,
+                                    "source": "mtf_confluence",
+                                    "extra": json.dumps({"rsi4h": round(best['rsi4h']), "rsi1h": round(best['rsi1h']), "rsi15": round(best['rsi15'])})})
+                log(f"  ✅ MTF 롱: {sym} ${usdt:.0f} SL={sl} TP={tp}")
+                send_message(TG_TOKEN, TG_CHAT, f"🎯 MTF 컨플루언스 롱\n{sym}\nRSI 4h={best['rsi4h']:.0f}/1h={best['rsi1h']:.0f}/15m={best['rsi15']:.0f}\nSL={sl} TP={tp}")
+                _institutional_post_entry(sym, 'mtf_confluence')
+            except Exception as e:
+                log(f"  ❌ MTF 진입 실패: {e}")
+
+    except Exception as e:
+        log(f"  MTF 오류: {e}")
+
+
+def check_vwap_reversion():
+    """
+    #O: VWAP 평균회귀 — 가격이 VWAP-1.5σ 이하 = 과매도 → 롱
+    VWAP = Σ(가격×거래량) / Σ(거래량), 24시간 기준
+    대형 종목만 허용 (소형 알트 유동성 부족 → PIPPIN -$1.10 손실)
+    """
+    global _vwap_cache
+    now = time.time()
+    if now - _vwap_cache['ts'] < 600:  # 10분 캐시
+        return
+    _vwap_cache['ts'] = now
+
+    ok, reason = _institutional_guard()
+    if not ok:
+        return
+
+    try:
+        client = get_client()
+        held = get_held_symbols()
+        if len(held) >= MAX_ORDERS:
+            return
+
+        # 대형 종목만 (소형 알트 VWAP 이탈 후 복귀 안 함)
+        _vwap_allowed = {'ETHUSDT', 'BTCUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'DOGEUSDT', 'ADAUSDT'}
+        symbols = [s for s in get_scan_universe() if s in _vwap_allowed]
+        signals = []
+
+        for sym in symbols:
+            if sym in held or sym in BLACKLIST:
+                continue
+            if sym in _cooldown and time.time() < _cooldown[sym]:
+                continue
+
+            try:
+                # 15분 캔들 96개 = 24시간
+                k = client.futures_klines(symbol=sym, interval='15m', limit=96)
+                if len(k) < 50:
+                    continue
+
+                # VWAP 계산
+                typical_prices = [(float(x[2]) + float(x[3]) + float(x[4])) / 3 for x in k]
+                volumes = [float(x[5]) for x in k]
+                cum_tp_vol = 0
+                cum_vol = 0
+                vwap_list = []
+                for tp, vol in zip(typical_prices, volumes):
+                    cum_tp_vol += tp * vol
+                    cum_vol += vol
+                    vwap_list.append(cum_tp_vol / cum_vol if cum_vol else tp)
+
+                vwap = vwap_list[-1]
+                px = float(k[-1][4])  # 현재 종가
+
+                # VWAP 표준편차 (최근 24h typical price 기준)
+                diffs = [(tp - vwap_list[i]) ** 2 for i, tp in enumerate(typical_prices)]
+                std = (sum(diffs) / len(diffs)) ** 0.5
+
+                if std == 0:
+                    continue
+
+                zscore = (px - vwap) / std
+                deviation_pct = (px - vwap) / vwap * 100
+
+                # RSI 확인
+                df = get_klines(sym, '1h', 50)
+                ind = calc_indicators(df)
+                rsi = ind.get('rsi', 50) or 50
+
+                # 시그널: VWAP-1.5σ 이하 + RSI<45 (완화)
+                is_signal = zscore < -1.5 and rsi < 45
+
+                # 로그 (1.5σ 이탈이면 기록)
+                if abs(zscore) > 1.5:
+                    try:
+                        with open(VWAP_LOG, 'a') as f:
+                            f.write(json.dumps({
+                                "time": datetime.now().strftime('%Y-%m-%d %H:%M'),
+                                "symbol": sym, "price": px,
+                                "vwap": round(vwap, 4),
+                                "zscore": round(zscore, 2),
+                                "dev_pct": round(deviation_pct, 2),
+                                "rsi": round(rsi),
+                                "signal": is_signal,
+                            }) + '\n')
+                    except:
+                        pass
+
+                if is_signal:
+                    signals.append({
+                        'symbol': sym, 'price': px, 'vwap': vwap,
+                        'zscore': zscore, 'rsi': rsi,
+                    })
+
+            except:
+                continue
+
+        # VWAP 이탈 가장 큰 것 1개 진입
+        if signals and len(held) < MAX_ORDERS:
+            best = sorted(signals, key=lambda x: x['zscore'])[0]
+            sym = best['symbol']
+            if _check_already_held(sym):
+                return
+            log(f"  📉 VWAP 회귀: {sym} z={best['zscore']:.1f} VWAP={best['vwap']:.4f} RSI={best['rsi']:.0f}")
+
+            usdt = max(ALT_USDT * (0.6 if _bear_mode else 0.7), 12)
+            lev = ETH_LEV if sym == 'ETHUSDT' else ALT_LEV
+            try:
+                set_margin_type(sym, "ISOLATED")
+                set_leverage(sym, lev)
+                px = float(get_price(sym))
+                qty = _round_qty(sym, usdt * lev / px)
+                if qty <= 0 or qty * px < 5:
+                    return
+
+                atr = (calc_indicators(get_klines(sym, '1h', 50)).get('atr', 0) or 0)
+                atr_pct = atr / px * 100 if px else 1
+                sl_pct = max(atr_pct * 1.5, 2.0 / lev)
+                sl = _round_price_sym(sym, px * (1 - sl_pct / 100))
+                # TP: VWAP 복귀 또는 최소 R:R 1.5 보장
+                _tp_vwap = best['vwap']
+                _tp_min = px * (1 + sl_pct * 1.5 / 100)  # 최소 R:R 1.5
+                tp = _round_price_sym(sym, max(_tp_vwap, _tp_min))
+
+                order = client.futures_create_order(
+                    symbol=sym, side='BUY', type='LIMIT',
+                    price=str(_round_price_sym(sym, px * 0.999)),
+                    quantity=str(qty), timeInForce='GTC'
+                )
+                _pending_fills[sym] = {
+                    'order_id': order['orderId'], 'sl': sl, 'tp': tp,
+                    'side': 'BUY', 'entry': px, 'score': 0, 'atr': atr,
+                    'time': time.time(), 'source': 'vwap_reversion',
+                    'expire': time.time() + 300,
+                }
+                trade_db.add_trade({"symbol": sym, "side": "🟢 롱", "action": "진입",
+                                    "qty": qty, "price": px, "sl": sl, "tp": tp,
+                                    "source": "vwap_reversion",
+                                    "extra": json.dumps({"vwap": round(best['vwap'], 4), "zscore": round(best['zscore'], 2)})})
+                log(f"  ✅ VWAP 롱: {sym} ${usdt:.0f} SL={sl} TP={tp}")
+                send_message(TG_TOKEN, TG_CHAT, f"📉 VWAP 평균회귀 롱\n{sym} z={best['zscore']:.1f}\nVWAP={best['vwap']:.4f}\nSL={sl} TP={tp}")
+                _institutional_post_entry(sym, 'vwap_reversion')
+            except Exception as e:
+                log(f"  ❌ VWAP 진입 실패: {e}")
+
+    except Exception as e:
+        log(f"  VWAP 오류: {e}")
+
+
+def check_volume_profile():
+    """
+    #P: 거래량 프로파일 — POC(최다 거래 가격대) 지지 감지
+    가격이 POC 아래에서 POC 방향 회귀 시 롱
+    """
+    global _vpoc_cache
+    now = time.time()
+    if now - _vpoc_cache['ts'] < 1800:  # 30분 캐시
+        return
+    _vpoc_cache['ts'] = now
+
+    ok, reason = _institutional_guard()
+    if not ok:
+        return
+
+    try:
+        client = get_client()
+        held = get_held_symbols()
+        if len(held) >= MAX_ORDERS:
+            return
+
+        symbols = get_scan_universe()
+        signals = []
+
+        for sym in symbols:
+            if sym in held or sym in BLACKLIST:
+                continue
+            if sym in _cooldown and time.time() < _cooldown[sym]:
+                continue
+
+            try:
+                # 1h 캔들 72개 = 3일
+                k = client.futures_klines(symbol=sym, interval='1h', limit=72)
+                if len(k) < 48:
+                    continue
+
+                closes = [float(x[4]) for x in k]
+                highs = [float(x[2]) for x in k]
+                lows = [float(x[3]) for x in k]
+                volumes = [float(x[5]) for x in k]
+
+                # 가격대별 거래량 히스토그램 (50 bins)
+                price_min = min(lows)
+                price_max = max(highs)
+                if price_max == price_min:
+                    continue
+
+                n_bins = 50
+                bin_size = (price_max - price_min) / n_bins
+                vol_profile = [0.0] * n_bins
+
+                for i in range(len(k)):
+                    # 캔들이 걸치는 bin에 거래량 분배
+                    low_bin = int((lows[i] - price_min) / bin_size)
+                    high_bin = int((highs[i] - price_min) / bin_size)
+                    low_bin = max(0, min(low_bin, n_bins - 1))
+                    high_bin = max(0, min(high_bin, n_bins - 1))
+                    n_covered = high_bin - low_bin + 1
+                    for b in range(low_bin, high_bin + 1):
+                        vol_profile[b] += volumes[i] / n_covered
+
+                # POC = 최다 거래량 가격대
+                poc_bin = vol_profile.index(max(vol_profile))
+                poc_price = price_min + (poc_bin + 0.5) * bin_size
+
+                px = closes[-1]
+
+                # HVN 위아래 구분 (POC 기준)
+                below_poc = px < poc_price
+                dist_from_poc = (poc_price - px) / poc_price * 100  # 양수면 아래
+
+                # RSI
+                df = get_klines(sym, '1h', 50)
+                ind = calc_indicators(df)
+                rsi = ind.get('rsi', 50) or 50
+
+                # 시그널: POC 아래 0.5~5% + RSI<45 + 상승 모멘텀 (직전 3캔들 상승)
+                recent_up = closes[-1] > closes[-3] if len(closes) >= 3 else False
+                is_signal = 0.5 < dist_from_poc < 5.0 and rsi < 45 and recent_up
+
+                # 로그
+                if below_poc and dist_from_poc > 0.5:
+                    try:
+                        with open(VPOC_LOG, 'a') as f:
+                            f.write(json.dumps({
+                                "time": datetime.now().strftime('%Y-%m-%d %H:%M'),
+                                "symbol": sym, "price": px,
+                                "poc": round(poc_price, 4),
+                                "dist_pct": round(dist_from_poc, 2),
+                                "rsi": round(rsi),
+                                "recent_up": recent_up,
+                                "signal": is_signal,
+                            }) + '\n')
+                    except:
+                        pass
+
+                if is_signal:
+                    signals.append({
+                        'symbol': sym, 'price': px, 'poc': poc_price,
+                        'dist': dist_from_poc, 'rsi': rsi,
+                    })
+
+            except:
+                continue
+
+        # POC 가장 가까운 것 1개 진입
+        if signals and len(held) < MAX_ORDERS:
+            best = sorted(signals, key=lambda x: x['dist'])[0]
+            sym = best['symbol']
+            if _check_already_held(sym):
+                return
+            log(f"  📊 VP POC: {sym} POC={best['poc']:.4f} 거리={best['dist']:.1f}% RSI={best['rsi']:.0f}")
+
+            usdt = max(ALT_USDT * (0.6 if _bear_mode else 0.7), 12)
+            lev = ETH_LEV if sym == 'ETHUSDT' else ALT_LEV
+            try:
+                set_margin_type(sym, "ISOLATED")
+                set_leverage(sym, lev)
+                px = float(get_price(sym))
+                qty = _round_qty(sym, usdt * lev / px)
+                if qty <= 0 or qty * px < 5:
+                    return
+
+                # SL: ATR 기반, TP: POC (최소 R:R 1.5 보장)
+                atr = (calc_indicators(get_klines(sym, '1h', 50)).get('atr', 0) or 0)
+                atr_pct = atr / px * 100 if px else 1
+                sl_pct = max(atr_pct * 1.5, 2.0 / lev)
+                sl = _round_price_sym(sym, px * (1 - sl_pct / 100))
+                _tp_poc = best['poc']
+                _tp_min = px * (1 + sl_pct * 1.5 / 100)  # 최소 R:R 1.5
+                tp = _round_price_sym(sym, max(_tp_poc, _tp_min))
+
+                order = client.futures_create_order(
+                    symbol=sym, side='BUY', type='LIMIT',
+                    price=str(_round_price_sym(sym, px * 0.999)),
+                    quantity=str(qty), timeInForce='GTC'
+                )
+                _pending_fills[sym] = {
+                    'order_id': order['orderId'], 'sl': sl, 'tp': tp,
+                    'side': 'BUY', 'entry': px, 'score': 0, 'atr': atr,
+                    'time': time.time(), 'source': 'volume_profile',
+                    'expire': time.time() + 300,
+                }
+                trade_db.add_trade({"symbol": sym, "side": "🟢 롱", "action": "진입",
+                                    "qty": qty, "price": px, "sl": sl, "tp": tp,
+                                    "source": "volume_profile",
+                                    "extra": json.dumps({"poc": round(best['poc'], 4), "dist": round(best['dist'], 2)})})
+                log(f"  ✅ VP 롱: {sym} ${usdt:.0f} SL={sl} TP={tp}")
+                send_message(TG_TOKEN, TG_CHAT, f"📊 거래량프로파일 롱\n{sym}\nPOC={best['poc']:.4f} ({best['dist']:.1f}% 아래)\nSL={sl} TP={tp}")
+                _institutional_post_entry(sym, 'volume_profile')
+            except Exception as e:
+                log(f"  ❌ VP 진입 실패: {e}")
+
+    except Exception as e:
+        log(f"  VP 오류: {e}")
+
+
 def _round_qty(symbol, qty):
     """수량을 심볼 규격에 맞게 반올림"""
     try:
@@ -2335,6 +3206,15 @@ def _round_qty(symbol, qty):
         return floor(qty / step) * step
     except Exception:
         return round(qty, 3)
+
+
+def _round_price_sym(symbol, price):
+    """심볼명으로 tick_size 조회 후 _round_price 호출"""
+    try:
+        _, tick = _get_symbol_filters(symbol)
+        return _round_price(float(price), float(tick))
+    except Exception:
+        return round(float(price), 4)
 
 
 def update_cycle():
@@ -2353,9 +3233,15 @@ def update_cycle():
             _signal_syms.add(sig['symbol'])
             log(f"  [시그널큐] {sig['symbol']} ← {sig['source']} (우선순위={sig['priority']})")
 
-    # 전체 스캔
+    # ========== updater 스캔/진입 OFF (CVD 전략만 운영) ==========
+    # 63건 51% -$17.69 → 거래할수록 손실. CVD(20건 55% +$1.39) 테스트 후 재활성화
     btc_up, btc_rsi = get_btc_trend()
     log(f"  BTC: {'UP' if btc_up else 'DOWN'} RSI={btc_rsi:.0f}")
+    scored = []  # updater 스캔 OFF → 빈 리스트
+    candidates = []
+    top_n = []
+    top_syms = set()
+    slots = MAX_ORDERS - held_count
 
     scan_list = get_scan_universe()
     # 시그널 큐 종목을 스캔 리스트 맨 앞에 추가 (중복 제거)
@@ -2530,9 +3416,13 @@ def update_cycle():
     # 슬롯 계산
     slots = MAX_ORDERS - held_count
     log(f"  슬롯: {slots}개 (보유 {held_count}/{MAX_ORDERS}) | 후보: {[c['symbol']+'('+str(c['score'])+')' for c in top_n]}")
-    if slots <= 0:
+    # ===== updater 진입 OFF — CVD만 운영 (63건 -$17.69 → 재검증 후 재활성화) =====
+    log(f"  🚫 updater 진입 OFF — CVD 전략만 운영 중")
+    if False:  # updater 진입 비활성화
+    # =====
+     if slots <= 0:
         log(f"  슬롯 없음")
-    else:
+     else:
         for a in top_n:
             sym = a['symbol']
             try:
@@ -2602,29 +3492,31 @@ def update_cycle():
                 log(f"  ❌ {sym} 주문 예외: {str(e)[:80]}")
             time.sleep(0.5)
 
-    # #158: 추세 후보 없으면 과매도 반등 스캔
-    if not top_n and slots > 0:
-        check_oversold_bounce()
+    # #158: bounce OFF — 14건 29% 승률 -$1.86, 수익/리스크 불균형으로 비활성화
+    # 데이터 더 쌓이고 조건 개선 후 재활성화 검토
+    # if not top_n and slots > 0:
+    #     check_oversold_bounce()
 
     # #4: 하락장 모드 판정
     update_market_mode()
 
-    # #1: 하락장 펀딩비 롱 (슬롯 여유 시)
-    if _bear_mode and slots > 0:
-        check_funding_long()
+    # ===== CVD만 운영 — 나머지 전략 OFF =====
+    # if _bear_mode and slots > 0:
+    #     check_funding_long()
+    # manage_crash_buys()
+    # check_pair_divergence()
+    # check_liquidation_bounce()
+    # scan_listing_announcements()
+    # check_listing_short()
 
-    # 크래시 바이 관리 (매 사이클 — 체결 확인 + 30분마다 갱신)
-    manage_crash_buys()
+    # CVD만 활성화 (20건 55% +$1.39 유일한 흑자)
+    check_cvd_divergence()       # #L: CVD 다이버전스
 
-    # #5: 페어 트레이딩 (30분마다 상관 분석)
-    check_pair_divergence()
-
-    # #6: OI 청산 바닥 감지 (10분마다)
-    check_liquidation_bounce()
-
-    # #159: 상장 공지 스캔 + 피크 대기 숏 체크 (매 사이클)
-    scan_listing_announcements()
-    check_listing_short()
+    # 나머지 기관 전략 OFF (데이터 축적 후 재검토)
+    # check_short_squeeze()        # #M
+    # check_mtf_confluence()       # #N
+    # check_vwap_reversion()       # #O: -$1.77
+    # check_volume_profile()       # #P
 
     # 텔레그램 보고 (30분마다만 전송, 체결 알림은 별도)
     global _last_tg_time
@@ -2741,7 +3633,7 @@ def daily_summary():
         week_pnl = {}
         for t in all_trades:
             d = (t.get('time') or '')[:10]
-            if d >= (now.replace(day=now.day-6)).strftime('%Y-%m-%d'):
+            if d >= (now - timedelta(days=6)).strftime('%Y-%m-%d'):
                 week_pnl[d] = week_pnl.get(d, 0) + (t.get('pnl') or 0)
 
         # 오늘 최고/최저 거래
@@ -2784,8 +3676,20 @@ _funding_cycle = 0  # 펀딩비 체크 사이클 카운터
 
 def main():
     global _funding_cycle
+
+    # #S: 이중 인스턴스 방지 — PID lock 파일
+    import fcntl
+    _lock_fd = open('/home/hyeok/01.APCC/00.ai-lab/.updater.lock', 'w')
+    try:
+        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_fd.write(str(os.getpid()))
+        _lock_fd.flush()
+    except IOError:
+        print("이미 다른 인스턴스 실행 중 → 종료", flush=True)
+        sys.exit(1)
+
     log("=" * 60)
-    log(f"포지션 업데이터 시작 (5분 스캔, 최대 {MAX_ORDERS}슬롯, 롱≥{MIN_SCORE} 변동성SL TP×5 트레일1.0% + 반등모드)")
+    log(f"포지션 업데이터 시작 (5분 스캔, 최대 {MAX_ORDERS}슬롯, 롱≥{MIN_SCORE} 변동성SL TP×5 트레일1.0%)")
     log(f"  시그널 큐 활성 | 펀딩비 감지 30분 주기 | 스캔 {SCAN_ALT_COUNT}종목 | 일일 {MAX_DAILY_TRADES}건")
     log("=" * 60)
 
