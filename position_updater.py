@@ -252,7 +252,7 @@ _rl_model = None
 _rl_loaded = False
 
 def _load_rl_model():
-    """ALT 범용 RL 모델 로드 (1회만)"""
+    """ALT 앙상블 RL 모델 로드 (3모델 다수결, 1회만)"""
     global _rl_model, _rl_loaded
     if _rl_loaded:
         return _rl_model
@@ -260,12 +260,23 @@ def _load_rl_model():
     try:
         from stable_baselines3 import PPO
         from pathlib import Path
-        p = Path('/home/hyeok/01.APCC/00.ai-lab/rl-lab/models/alt_universal_exp01/ppo_alt.zip')
-        if p.exists():
-            _rl_model = PPO.load(str(p))
-            log("  RL 알트 범용모델 로드 완료")
+        base = Path('/home/hyeok/01.APCC/00.ai-lab/rl-lab/models')
+        alt_paths = {
+            "alt_exp01": base / "alt_universal_exp01/ppo_alt.zip",
+            "alt_seed200": base / "alt_v2_seed200/ppo_alt.zip",
+            "alt_seed700": base / "alt_v2_seed700/ppo_alt.zip",
+        }
+        if all(p.exists() for p in alt_paths.values()):
+            _rl_model = {k: PPO.load(str(p)) for k, p in alt_paths.items()}
+            log(f"  RL 알트 앙상블 로드 (3모델 다수결)")
         else:
-            log("  RL 알트 모델 파일 없음")
+            # 폴백: 단일 모델
+            p = base / "alt_universal_exp01/ppo_alt.zip"
+            if p.exists():
+                _rl_model = {"alt_exp01": PPO.load(str(p))}
+                log("  RL 알트 단일모델 폴백")
+            else:
+                log("  RL 알트 모델 파일 없음")
     except Exception as e:
         log(f"  RL 로드 실패: {str(e)[:40]}")
     return _rl_model
@@ -339,13 +350,23 @@ def get_rl_signal_lite(symbol):
             rows.append(row)
 
         obs = np.array(rows, dtype=np.float32).flatten()
-        a, _ = model.predict(obs, deterministic=True)
-        action = int(a)
+
+        # 앙상블 다수결 투표
+        from collections import Counter as _Ctr
+        models = model if isinstance(model, dict) else {"m": model}
+        votes = []
+        for k, m in models.items():
+            a, _ = m.predict(obs, deterministic=True)
+            votes.append(int(a))
+        cnt = _Ctr(votes)
+        maj = cnt.most_common(1)[0]
+        action = maj[0] if maj[1] >= len(models) // 2 + 1 else 0
 
         # 0=관망, 1=롱, 2=청산
         signal_map = {0: 'wait', 1: 'long', 2: 'close'}
         signal = signal_map.get(action, 'wait')
-        bonus = 3 if action == 1 else (-3 if action == 0 else 0)
+        unanimous = len(set(votes)) == 1
+        bonus = (5 if unanimous else 3) if action == 1 else (-3 if action == 0 else 0)
 
         _rl_cache[symbol] = {'ts': now, 'signal': signal, 'bonus': bonus}
         return signal, bonus
@@ -2457,7 +2478,7 @@ def _institutional_post_entry(sym, source):
 def check_bb_box():
     """
     볼린저 박스 왕복 — 횡보장에서 하단 매수 → 상단 청산
-    조건: BB 폭 < 3% (박스권) + 가격이 하단 근처 + RSI 35~55 (과매도 아닌 횡보)
+    조건: BB 폭 1~4% (박스권) + 가격이 하단 근처 + RSI 30~55 (과매도 아닌 횡보)
     """
     global _bb_box_cache
     now = time.time()
@@ -2504,9 +2525,9 @@ def check_bb_box():
                 # 가격의 밴드 내 위치 (0%=하단, 100%=상단)
                 bb_pos = (px - bb_lower) / (bb_upper - bb_lower) * 100
 
-                # 조건: 박스권(폭 1~4%) + 하단 근처(20% 이하) + RSI 횡보(30~55)
+                # 조건: 박스권(폭 1~4%) + 하단 근처(-5%~20%) + RSI 횡보(30~55)
                 is_box = 1.0 < bb_width < 4.0
-                is_near_bottom = bb_pos < 20
+                is_near_bottom = -5 < bb_pos < 20  # 하단 약간 아래도 허용
                 is_sideways_rsi = 30 < rsi < 55
 
                 is_signal = is_box and is_near_bottom and is_sideways_rsi
@@ -2552,6 +2573,12 @@ def check_bb_box():
                     continue
                 log(f"  📦 BB 박스 감지: {sym} 폭={best['bb_width']:.1f}% 위치={best['bb_pos']:.0f}% RSI={best['rsi']:.0f}")
 
+                # 진입 전 일일 한도 재확인
+                _today = datetime.now().strftime('%Y-%m-%d')
+                if _daily_trades.get('date') == _today and _daily_trades.get('count', 0) >= MAX_DAILY_TRADES:
+                    log(f"  ⏭ BB {sym} 일일 한도 도달 → 스킵")
+                    break
+
                 usdt = max(ALT_USDT * (0.7 if _bear_mode else 1.0), 12)
                 lev = ETH_LEV if sym == 'ETHUSDT' else ALT_LEV
                 try:
@@ -2566,18 +2593,29 @@ def check_bb_box():
                     if qty <= 0:
                         continue
 
-                    # SL: ATR 기반 (좁은 박스에서도 적정 거리), TP: 상단 -0.3%
+                    # SL: ATR 기반, TP: 상단 -0.3%
                     atr = best.get('atr', 0) or 0
                     atr_pct = atr / px * 100 if px else 1
-                    sl_pct = max(atr_pct * 1.5, 1.0 / lev)
+                    sl_pct = max(atr_pct * 1.5, 1.5 / lev)  # 최소 0.75% (수수료 커버)
                     sl = _round_price_sym(sym, px * (1 - sl_pct / 100))
-                    tp = _round_price_sym(sym, best['bb_upper'] * 0.997)  # 상단 -0.3%
+                    tp = _round_price_sym(sym, best['bb_upper'] * 0.997)
+
+                    # TP가 진입가 이하면 스킵 (밴드 돌파 등 비정상)
+                    if tp <= px * 1.001:
+                        log(f"  ⏭ BB {sym} TP({tp}) ≤ px({px}) 스킵")
+                        continue
 
                     # R:R 최소 1.2 보장
                     _sl_dist = abs(px - sl)
                     _tp_dist = abs(tp - px)
                     if _sl_dist > 0 and _tp_dist / _sl_dist < 1.2:
                         log(f"  ⏭ BB {sym} R:R {_tp_dist/_sl_dist:.1f} < 1.2 스킵")
+                        continue
+
+                    # RL 앙상블 검증 — 관망이면 BB 진입 차단
+                    _rl_sig, _rl_bon = get_rl_signal_lite(sym)
+                    if _rl_sig == 'wait':
+                        log(f"  ⏭ BB {sym} RL 관망 → 진입 차단")
                         continue
 
                     # 시장가 진입 (하단 근처에서 바로 진입 + SL/TP 즉시 배치)
@@ -2611,15 +2649,22 @@ def check_bb_box():
                                 symbol=sym, side=close_side, type='MARKET',
                                 quantity=str(qty), reduceOnly=True)
                             log(f"  🚨 BB {sym} SL 미배치 → 즉시 청산")
-                            continue
+                            send_message(TG_TOKEN, TG_CHAT, f"🚨 {sym} SL 미배치 → 즉시 청산")
                         except: pass
+                        continue
 
                     _sltp_done.add(sym)
                     _tp_cache[sym] = tp
                     _entry_time[sym] = time.time()
                     _entry_source[sym] = 'bb_box'
 
-                    entry_px = px  # 시장가 진입가 ≈ 현재가
+                    # 실제 체결가 조회
+                    try:
+                        _fill = client.futures_get_all_orders(symbol=sym, limit=1)
+                        _avg = float(_fill[-1].get('avgPrice', 0)) if _fill else 0
+                        entry_px = _avg if _avg > 0 else px
+                    except:
+                        entry_px = px
                     trade_db.add_trade({"symbol": sym, "side": "🟢 롱", "action": "진입",
                                         "qty": qty, "price": entry_px, "sl": sl, "tp": tp,
                                         "source": "bb_box",
@@ -2773,64 +2818,74 @@ def check_cvd_divergence():
                 sym = best['symbol']
                 if _check_already_held(sym):
                     continue
-            log(f"  📊 CVD 다이��전스 감지: {sym} RSI={best['rsi']:.0f} CVD↑{best['cvd_delta']}%")
+                # 진입 전 일일 한도 재확인
+                _today = datetime.now().strftime("%Y-%m-%d")
+                if _daily_trades.get("date") == _today and _daily_trades.get("count", 0) >= MAX_DAILY_TRADES:
+                    break
+                log(f"  📊 CVD 다이��전스 감지: {sym} RSI={best['rsi']:.0f} CVD↑{best['cvd_delta']}%")
 
-            # CVD 전용 ���입금 — $25 기본, 하락장 70%
-            usdt = max(ALT_USDT * (0.7 if _bear_mode else 1.0), 12)
-            lev = ETH_LEV if sym == 'ETHUSDT' else ALT_LEV
-            try:
-                set_margin_type(sym, "ISOLATED")
-                set_leverage(sym, lev)
-                px = float(get_price(sym))
-                limit_px = _round_price_sym(sym, px * 0.995)  # 0.5% 아래 지정가
+                # CVD 전용 ���입금 — $25 기본, 하락장 70%
+                usdt = max(ALT_USDT * (0.7 if _bear_mode else 1.0), 12)
+                lev = ETH_LEV if sym == 'ETHUSDT' else ALT_LEV
+                try:
+                    set_margin_type(sym, "ISOLATED")
+                    set_leverage(sym, lev)
+                    px = float(get_price(sym))
+                    limit_px = _round_price_sym(sym, px * 0.995)  # 0.5% 아래 지정가
 
-                qty = _round_qty(sym, usdt * lev / px)
-                # 노셔널 $20 최소 보장 (LIMIT 가격 기준)
-                if qty <= 0 or qty * limit_px < 20:
-                    step, _ = _get_symbol_filters(sym)
-                    qty = _round_qty(sym, 21.0 / limit_px + float(step))
-                if qty <= 0:
-                    return
+                    qty = _round_qty(sym, usdt * lev / px)
+                    # 노셔널 $20 최소 보장 (LIMIT 가격 기준)
+                    if qty <= 0 or qty * limit_px < 20:
+                        step, _ = _get_symbol_filters(sym)
+                        qty = _round_qty(sym, 21.0 / limit_px + float(step))
+                    if qty <= 0:
+                        return
 
-                # ATR: 시그널 스캔���서 이미 계산한 값 재사용
-                atr = best.get('atr', 0) or 0
-                if atr <= 0:
-                    _ind = calc_indicators(get_klines(sym, '1h', 50))
-                    atr = _ind.get('atr', 0) or 0
-                atr_pct = atr / px * 100 if px else 1
+                    # ATR: 시그널 스캔���서 이미 계산한 값 재사용
+                    atr = best.get('atr', 0) or 0
+                    if atr <= 0:
+                        _ind = calc_indicators(get_klines(sym, '1h', 50))
+                        atr = _ind.get('atr', 0) or 0
+                    atr_pct = atr / px * 100 if px else 1
 
-                sl_pct = max(atr_pct * 1.5, 2.0 / lev)
-                tp_pct = max(atr_pct * 5.0, sl_pct * 3.3)
-                sl = _round_price_sym(sym, limit_px * (1 - sl_pct / 100))  # SL/TP도 LIMIT 가격 기준
-                tp = _round_price_sym(sym, limit_px * (1 + tp_pct / 100))
+                    sl_pct = max(atr_pct * 1.5, 2.0 / lev)
+                    tp_pct = max(atr_pct * 5.0, sl_pct * 3.3)
+                    sl = _round_price_sym(sym, limit_px * (1 - sl_pct / 100))  # SL/TP도 LIMIT 가격 기준
+                    tp = _round_price_sym(sym, limit_px * (1 + tp_pct / 100))
 
-                order = client.futures_create_order(
-                    symbol=sym, side='BUY', type='LIMIT',
-                    price=str(limit_px),
-                    quantity=str(qty), timeInForce='GTC'
-                )
-                _pending_fills[sym] = {
-                    'order_id': order['orderId'], 'sl': sl, 'tp': tp,
-                    'side': 'BUY', 'entry': limit_px, 'score': 0, 'atr': atr,
-                    'time': time.time(), 'source': 'cvd_divergence',
-                    'expire': time.time() + 300,
-                }
-                trade_db.add_trade({"symbol": sym, "side": "🟢 롱", "action": "진입",
-                                    "qty": qty, "price": limit_px, "sl": sl, "tp": tp,
-                                    "source": "cvd_divergence",
-                                    "extra": json.dumps({"rsi": round(best['rsi']), "cvd_delta": best['cvd_delta']})})
-                _rr = tp_pct / sl_pct if sl_pct else 0
-                log(f"  ✅ CVD 롱 진입: {sym} ${usdt:.0f} @ {limit_px} SL={sl} TP={tp} R:R=1:{_rr:.1f}")
-                send_message(TG_TOKEN, TG_CHAT,
-                    f"📊 <b>CVD 다이버전스 롱</b>\n"
-                    f"   {sym} @ ${limit_px}\n"
-                    f"   RSI={best['rsi']:.0f} | CVD↑{best['cvd_delta']:.0f}%\n"
-                    f"   노셔널 ${qty * limit_px:.1f} (${usdt}×{lev}x)\n"
-                    f"   SL ${sl} ({sl_pct:.1f}%) → TP ${tp} ({tp_pct:.1f}%)\n"
-                    f"   R:R = 1:{_rr:.1f}")
-                _institutional_post_entry(sym, 'cvd_divergence')
-                _entered += 1
-            except Exception as e:
+                    # RL 앙상블 검증 — 관망이면 CVD 진입 차단
+                    _rl_sig, _rl_bon = get_rl_signal_lite(sym)
+                    if _rl_sig == 'wait':
+                        log(f"  ⏭ CVD {sym} RL 관망 → 진입 차단")
+                        return
+
+                    order = client.futures_create_order(
+                        symbol=sym, side='BUY', type='LIMIT',
+                        price=str(limit_px),
+                        quantity=str(qty), timeInForce='GTC'
+                    )
+                    _pending_fills[sym] = {
+                        'order_id': order['orderId'], 'sl': sl, 'tp': tp,
+                        'side': 'BUY', 'entry': limit_px, 'score': 0, 'atr': atr,
+                        'time': time.time(), 'source': 'cvd_divergence',
+                        'expire': time.time() + 300,
+                    }
+                    trade_db.add_trade({"symbol": sym, "side": "🟢 롱", "action": "진입",
+                                        "qty": qty, "price": limit_px, "sl": sl, "tp": tp,
+                                        "source": "cvd_divergence",
+                                        "extra": json.dumps({"rsi": round(best['rsi']), "cvd_delta": best['cvd_delta']})})
+                    _rr = tp_pct / sl_pct if sl_pct else 0
+                    log(f"  ✅ CVD 롱 진입: {sym} ${usdt:.0f} @ {limit_px} SL={sl} TP={tp} R:R=1:{_rr:.1f}")
+                    send_message(TG_TOKEN, TG_CHAT,
+                        f"📊 <b>CVD 다이버전스 롱</b>\n"
+                        f"   {sym} @ ${limit_px}\n"
+                        f"   RSI={best['rsi']:.0f} | CVD↑{best['cvd_delta']:.0f}%\n"
+                        f"   노셔널 ${qty * limit_px:.1f} (${usdt}×{lev}x)\n"
+                        f"   SL ${sl} ({sl_pct:.1f}%) → TP ${tp} ({tp_pct:.1f}%)\n"
+                        f"   R:R = 1:{_rr:.1f}")
+                    _institutional_post_entry(sym, 'cvd_divergence')
+                    _entered += 1
+                except Exception as e:
                 log(f"  ❌ CVD 진입 실패: {e}")
 
     except Exception as e:
