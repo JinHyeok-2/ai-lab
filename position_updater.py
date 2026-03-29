@@ -38,7 +38,9 @@ MAX_SAME_DIR = 4        # 동일 방향 최대 (2→4, 롱전용이므로 MAX_OR
 MAX_DAILY_TRADES = 5    # 하루 최대 거래 횟수 (8→5, 15건 이하 수익 구간)
 NIGHT_HOURS = {0, 1, 2, 3, 4, 21, 22, 23}  # #H: 야간 진입 차단 확대 (21~04시 KST, 21시 6건전패 반영)
 BLACKLIST = {'BRUSDT', 'SIRENUSDT', 'XAUUSDT', 'XAGUSDT', 'RIVERUSDT', 'SIGNUSDT', 'PAXGUSDT', 'BSBUSDT',
-             'A2ZUSDT', 'PTBUSDT', 'VIDTUSDT', 'MEMEFIUSDT', 'AMBUSDT', 'TROYUSDT', 'LEVERUSDT', 'NOMUSDT'}  # + 거래량0/지표오류 종목
+             'A2ZUSDT', 'PTBUSDT', 'VIDTUSDT', 'MEMEFIUSDT', 'AMBUSDT', 'TROYUSDT', 'LEVERUSDT', 'NOMUSDT',
+             'PORT3USDT', 'NEIROETHUSDT', 'BSWUSDT', 'AGIXUSDT', 'SXPUSDT',
+             'ALPACAUSDT', 'BNXUSDT', 'ALPHAUSDT'}  # + get_price 에러
 TG_TOKEN = TELEGRAM_TOKEN
 TG_CHAT  = TELEGRAM_CHAT_ID
 
@@ -105,6 +107,7 @@ _entry_source = {}  # {symbol: 'cvd_divergence' 등} — 전략별 보유시간 
 
 # ── 볼린저 박스 왕복 전략 ──
 _bb_box_cache = {'ts': 0}
+_bb_limit_orders = {}  # {symbol: {'order_id': ..., 'price': ..., 'qty': ..., 'sl': ..., 'tp': ...}}
 BB_BOX_LOG = '/home/hyeok/01.APCC/00.ai-lab/bb_box_signals.jsonl'
 
 # ── 기관 매매법 전략 변수 ──
@@ -974,7 +977,8 @@ def check_fills():
 
 
 def check_partial_tp():
-    """실제 수익 3%+ 시 절반 청산 + SL 본절 이동 (#137)"""
+    """실제 수익 3%+ 시 절반 청산 + SL 본절 이동 (#137)
+    중복 방지: 노셔널 $15 미만이면 이미 부분 익절된 것으로 간주 → 스킵"""
     try:
         client = get_client()
         for pos in _get_positions_cached():
@@ -987,15 +991,19 @@ def check_partial_tp():
             if entry <= 0 or qty <= 0:
                 continue
 
+            # 중복 방지: 노셔널 $15 미만 = 이미 부분 익절됨 (재시작 시에도 작동)
+            _notional = qty * entry
+            if _notional < 15:
+                _partial_done.add(sym)
+                continue
+
             cur = get_price(sym)
             is_long = 'LONG' in side.upper()
 
-            # TP 캐시에서 가져오기 (DB 조회 불필요)
             if sym not in _tp_cache:
                 continue
             tp = float(_tp_cache[sym])
 
-            # #4: 실제 수익 3%+ 시 부분 익절 (TP 기반 → 수익률 기반으로 변경)
             is_major = sym in ('ETHUSDT', 'BTCUSDT')
             lev = 3 if is_major else 2
             if is_long:
@@ -1003,8 +1011,7 @@ def check_partial_tp():
             else:
                 pnl_real = (entry - cur) / entry * 100 * lev
 
-            if pnl_real >= 3.0:  # 실제 수익 3%+
-                # 절반 청산
+            if pnl_real >= 3.0:
                 half_qty = _round_qty(sym, qty / 2)
                 if half_qty <= 0:
                     continue
@@ -2493,33 +2500,49 @@ def check_bb_box():
                 continue
 
             try:
-                ind = calc_indicators(get_klines(sym, '1h', 50))
-                bb_upper = ind.get('bb_upper', 0) or 0
-                bb_lower = ind.get('bb_lower', 0) or 0
-                bb_mid = ind.get('bb_mid', 0) or 0
-                rsi = ind.get('rsi', 50) or 50
-                atr = ind.get('atr', 0) or 0
-                if rsi != rsi: continue  # nan
+                # 멀티타임프레임 BB (15m + 30m + 1h)
                 px = float(get_price(sym))
+                _bb_bottom_count = 0
+                _bb_1h = None
 
-                if not (bb_upper > bb_lower > 0 and px > 0):
+                for _tf in ['15m', '30m', '1h']:
+                    _ind = calc_indicators(get_klines(sym, _tf, 50))
+                    _bu = _ind.get('bb_upper', 0) or 0
+                    _bl = _ind.get('bb_lower', 0) or 0
+                    _bm = _ind.get('bb_mid', 0) or 0
+                    if not (_bu > _bl > 0):
+                        continue
+                    _pos = (px - _bl) / (_bu - _bl) * 100
+                    if -5 < _pos < 20:
+                        _bb_bottom_count += 1
+                    if _tf == '1h':
+                        _bb_1h = {
+                            'upper': _bu, 'lower': _bl, 'mid': _bm,
+                            'pos': _pos, 'width': (_bu - _bl) / _bm * 100,
+                            'rsi': _ind.get('rsi', 50) or 50,
+                            'atr': _ind.get('atr', 0) or 0,
+                        }
+
+                if not _bb_1h:
                     continue
+                rsi = _bb_1h['rsi']
+                atr = _bb_1h['atr']
+                bb_upper = _bb_1h['upper']
+                bb_lower = _bb_1h['lower']
+                bb_mid = _bb_1h['mid']
+                bb_width = _bb_1h['width']
+                bb_pos = _bb_1h['pos']
+                if rsi != rsi: continue  # nan
 
-                # 박스 폭 (%)
-                bb_width = (bb_upper - bb_lower) / bb_mid * 100 if bb_mid else 0
-
-                # 가격의 밴드 내 위치 (0%=하단, 100%=상단)
-                bb_pos = (px - bb_lower) / (bb_upper - bb_lower) * 100
-
-                # 조건: 박스권(폭 1~4%) + 하단 근처(-5%~20%) + RSI 횡보(30~55)
+                # 조건: 1h 박스권(폭 1~4%) + 2/3 TF 하단 합의 + RSI 횡보(30~55)
                 is_box = 1.0 < bb_width < 4.0
-                is_near_bottom = -5 < bb_pos < 20  # 하단 약간 아래도 허용
+                is_mtf_bottom = _bb_bottom_count >= 2  # 15m/30m/1h 중 2개+ 하단
                 is_sideways_rsi = 30 < rsi < 55
 
-                is_signal = is_box and is_near_bottom and is_sideways_rsi
+                is_signal = is_box and is_mtf_bottom and is_sideways_rsi
 
                 # 로그
-                if is_box and (is_near_bottom or rsi < 40):
+                if is_box and (_bb_bottom_count >= 1 or rsi < 40):
                     try:
                         with open(BB_BOX_LOG, 'a') as f:
                             f.write(json.dumps({
@@ -2528,6 +2551,7 @@ def check_bb_box():
                                 "bb_width": round(bb_width, 2),
                                 "bb_pos": round(bb_pos, 1),
                                 "rsi": round(rsi),
+                                "mtf_bottom": _bb_bottom_count,
                                 "signal": is_signal,
                             }) + '\n')
                     except Exception:
@@ -2539,30 +2563,41 @@ def check_bb_box():
                         'bb_width': bb_width, 'bb_pos': bb_pos,
                         'bb_upper': bb_upper, 'bb_lower': bb_lower,
                         'bb_mid': bb_mid, 'atr': atr,
+                        'mtf_bottom': _bb_bottom_count,
                     })
 
             except Exception as _e:
                 log(f"  ⚠️ BB {sym} 스캔 오류: {str(_e)[:60]}")
                 continue
 
-        # 밴드 위치 가장 낮은 것 (바닥에 가장 가까운 것) 최대 2개
-        if signals and len(held) < MAX_ORDERS:
+        # BB 진입: 위치에 따라 시장가/LIMIT 분기
+        # < 10%: 시장가 즉시 (거의 하단) / 10~30%: LIMIT 하단 예약
+        # 1. 기존 LIMIT 예약 중 조건 벗어난 것 취소
+        _sig_syms = {s['symbol'] for s in signals}
+        for _sym in list(_bb_limit_orders.keys()):
+            if _sym in held or _sym not in _sig_syms:
+                try:
+                    client.futures_cancel_order(symbol=_sym, orderId=_bb_limit_orders[_sym]['order_id'])
+                    log(f"  📦 BB {_sym} 예약 취소 (조건 벗어남)")
+                except: pass
+                _pending_fills.pop(_sym, None)
+                del _bb_limit_orders[_sym]
+
+        # 2. 시그널 종목 진입
+        if signals:
             ranked = sorted(signals, key=lambda x: x['bb_pos'])
-            _max_entry = min(2, MAX_ORDERS - len(held))
+            _max_orders = min(3, MAX_ORDERS - len(held))
+            _placed = len([s for s in _bb_limit_orders if s not in held])
             _entered = 0
 
             for best in ranked:
-                if _entered >= _max_entry:
+                if _entered + _placed >= _max_orders:
                     break
                 sym = best['symbol']
                 if _check_already_held(sym):
                     continue
-                log(f"  📦 BB 박스 감지: {sym} 폭={best['bb_width']:.1f}% 위치={best['bb_pos']:.0f}% RSI={best['rsi']:.0f}")
-
-                # 진입 전 일일 한도 재확인
                 _today = datetime.now().strftime('%Y-%m-%d')
                 if _daily_trades.get('date') == _today and _daily_trades.get('count', 0) >= MAX_DAILY_TRADES:
-                    log(f"  ⏭ BB {sym} 일일 한도 도달 → 스킵")
                     break
 
                 usdt = max(ALT_USDT * (0.7 if _bear_mode else 1.0), 12)
@@ -2572,103 +2607,101 @@ def check_bb_box():
                     set_leverage(sym, lev)
                     px = float(get_price(sym))
 
-                    qty = _round_qty(sym, usdt * lev / px)
-                    if qty <= 0 or qty * px < 20:
-                        step, _ = _get_symbol_filters(sym)
-                        qty = _round_qty(sym, 21.0 / px + float(step))
-                    if qty <= 0:
-                        continue
-
-                    # SL: ATR 기반, TP: 상단 -0.3%
                     atr = best.get('atr', 0) or 0
                     atr_pct = atr / px * 100 if px else 1
-                    sl_pct = max(atr_pct * 1.5, 1.5 / lev)  # 최소 0.75% (수수료 커버)
-                    sl = _round_price_sym(sym, px * (1 - sl_pct / 100))
+                    if atr_pct < 0.5:
+                        atr_pct = 1.0
+                    sl_pct = max(atr_pct * 1.5, 1.5 / lev)
                     tp = _round_price_sym(sym, best['bb_upper'] * 0.997)
-
-                    # TP가 진입가 이하면 스킵 (밴드 돌파 등 비정상)
-                    if tp <= px * 1.001:
-                        log(f"  ⏭ BB {sym} TP({tp}) ≤ px({px}) 스킵")
+                    if best['bb_upper'] <= px * 1.01:
                         continue
+                    _mtf = best.get('mtf_bottom', 0)
 
-                    # R:R 최소 1.2 보장
-                    _sl_dist = abs(px - sl)
-                    _tp_dist = abs(tp - px)
-                    if _sl_dist > 0 and _tp_dist / _sl_dist < 1.2:
-                        log(f"  ⏭ BB {sym} R:R {_tp_dist/_sl_dist:.1f} < 1.2 스킵")
-                        continue
+                    # === 위치 < 10%: 시장가 즉시 ===
+                    if best['bb_pos'] < 10:
+                        sl = _round_price_sym(sym, px * (1 - sl_pct / 100))
+                        qty = _round_qty(sym, usdt * lev / px)
+                        if qty <= 0 or qty * px < 20:
+                            step, _ = _get_symbol_filters(sym)
+                            qty = _round_qty(sym, 21.0 / px + float(step))
+                        if qty <= 0: continue
+                        _sl_dist = abs(px - sl)
+                        _tp_dist = abs(tp - px)
+                        _rr = _tp_dist / _sl_dist if _sl_dist else 0
 
-                    # RL 앙상블 검증 — 관망이면 BB 진입 조건 강화
-                    _rl_sig, _ = get_rl_signal_lite(sym)
-                    if _rl_sig == 'long':
-                        log(f"  ✅ BB {sym} RL 롱 합의")
-                    elif _rl_sig == 'wait':
-                        log(f"  ⏭ BB {sym} RL 관망 → 진입 차단")
-                        continue
-
-                    # 시장가 진입 (하단 근처에서 바로 진입 + SL/TP 즉시 배치)
-                    order = client.futures_create_order(
-                        symbol=sym, side='BUY', type='MARKET',
-                        quantity=str(qty))
-                    _positions_cache['ts'] = 0  # 캐시 리셋
-
-                    # SL/TP 즉시 배치
-                    close_side = 'SELL'
-                    _sl_ok = _tp_ok = False
-                    try:
-                        client.futures_create_order(
-                            symbol=sym, side=close_side, type='STOP_MARKET',
-                            stopPrice=str(sl), quantity=str(qty), reduceOnly=True)
-                        _sl_ok = True
-                    except Exception as _se:
-                        log(f"  ⚠️ BB {sym} SL 배치 실패: {_se}")
-                    try:
-                        client.futures_create_order(
-                            symbol=sym, side=close_side, type='TAKE_PROFIT_MARKET',
-                            stopPrice=str(tp), quantity=str(qty), reduceOnly=True)
-                        _tp_ok = True
-                    except Exception as _te:
-                        log(f"  ⚠️ BB {sym} TP 배치 실패: {_te}")
-
-                    # SL 실패 시 즉시 청산 (보호)
-                    if not _sl_ok:
+                        order = client.futures_create_order(symbol=sym, side='BUY', type='MARKET', quantity=str(qty))
+                        _positions_cache['ts'] = 0
+                        _sl_ok = False
                         try:
-                            client.futures_create_order(
-                                symbol=sym, side=close_side, type='MARKET',
-                                quantity=str(qty), reduceOnly=True)
-                            log(f"  🚨 BB {sym} SL 미배치 → 즉시 청산")
-                            send_message(TG_TOKEN, TG_CHAT, f"🚨 {sym} SL 미배치 → 즉시 청산")
+                            client.futures_create_order(symbol=sym, side='SELL', type='STOP_MARKET',
+                                stopPrice=str(sl), quantity=str(qty), reduceOnly=True)
+                            _sl_ok = True
                         except: pass
-                        continue
+                        _tp_qty = _round_qty(sym, qty / 2) or qty
+                        try:
+                            client.futures_create_order(symbol=sym, side='SELL', type='TAKE_PROFIT_MARKET',
+                                stopPrice=str(tp), quantity=str(_tp_qty), reduceOnly=True)
+                        except: pass
+                        if not _sl_ok:
+                            try:
+                                client.futures_create_order(symbol=sym, side='SELL', type='MARKET', quantity=str(qty), reduceOnly=True)
+                            except: pass
+                            continue
+                        _sltp_done.add(sym)
+                        _tp_cache[sym] = tp
+                        _entry_time[sym] = time.time()
+                        _entry_source[sym] = 'bb_box'
+                        try:
+                            _fill = client.futures_get_all_orders(symbol=sym, limit=1)
+                            _avg = float(_fill[-1].get('avgPrice', 0)) if _fill else 0
+                            entry_px = _avg if _avg > 0 else px
+                        except: entry_px = px
+                        trade_db.add_trade({"symbol": sym, "side": "🟢 롱", "action": "진입",
+                            "qty": qty, "price": entry_px, "sl": sl, "tp": tp, "source": "bb_box",
+                            "extra": json.dumps({"bb_width": round(best['bb_width'], 1), "bb_pos": round(best['bb_pos'], 0), "mode": "market"})})
+                        log(f"  ✅ BB 시장가: {sym} @ {entry_px} (위치{best['bb_pos']:.0f}%<10%) R:R=1:{_rr:.1f} MTF={_mtf}/3")
+                        send_message(TG_TOKEN, TG_CHAT,
+                            f"📦 <b>BB 즉시 롱</b>\n   {sym} @ ${entry_px} (하단 {best['bb_pos']:.0f}%)\n   MTF {_mtf}/3 | R:R 1:{_rr:.1f}")
+                        _institutional_post_entry(sym, 'bb_box')
+                        _entered += 1
 
-                    _sltp_done.add(sym)
-                    _tp_cache[sym] = tp
-                    _entry_time[sym] = time.time()
-                    _entry_source[sym] = 'bb_box'
+                    # === 위치 10~30%: LIMIT 하단 예약 ===
+                    else:
+                        limit_px = _round_price_sym(sym, best['bb_lower'] * 1.002)
+                        sl = _round_price_sym(sym, limit_px * (1 - sl_pct / 100))
+                        qty = _round_qty(sym, usdt * lev / limit_px)
+                        if qty <= 0 or qty * limit_px < 20:
+                            step, _ = _get_symbol_filters(sym)
+                            qty = _round_qty(sym, 21.0 / limit_px + float(step))
+                        if qty <= 0: continue
+                        _sl_dist = abs(limit_px - sl)
+                        _tp_dist = abs(tp - limit_px)
+                        _rr = _tp_dist / _sl_dist if _sl_dist else 0
 
-                    # 실제 체결가 조회
-                    try:
-                        _fill = client.futures_get_all_orders(symbol=sym, limit=1)
-                        _avg = float(_fill[-1].get('avgPrice', 0)) if _fill else 0
-                        entry_px = _avg if _avg > 0 else px
-                    except:
-                        entry_px = px
-                    trade_db.add_trade({"symbol": sym, "side": "🟢 롱", "action": "진입",
-                                        "qty": qty, "price": entry_px, "sl": sl, "tp": tp,
-                                        "source": "bb_box",
-                                        "extra": json.dumps({"bb_width": round(best['bb_width'], 1), "bb_pos": round(best['bb_pos'], 0)})})
-                    _rr = _tp_dist / _sl_dist if _sl_dist else 0
-                    log(f"  ✅ BB 박스 롱: {sym} @ {entry_px} SL={sl}({sl_pct:.1f}%) TP={tp} R:R=1:{_rr:.1f}")
-                    send_message(TG_TOKEN, TG_CHAT,
-                        f"📦 <b>BB 박스 롱</b>\n"
-                        f"   {sym} @ ${entry_px}\n"
-                        f"   박스 {best['bb_lower']:.4f}~{best['bb_upper']:.4f} (폭{best['bb_width']:.1f}%)\n"
-                        f"   SL ${sl} ({sl_pct:.1f}%) → TP ${tp}\n"
-                        f"   R:R 1:{_rr:.1f} | {'SL✅TP✅' if _sl_ok and _tp_ok else 'SL/TP 확인필요'}")
-                    _institutional_post_entry(sym, 'bb_box')
-                    _entered += 1
+                        if sym in _bb_limit_orders:
+                            _old = _bb_limit_orders[sym]
+                            if abs(_old['price'] - limit_px) / limit_px < 0.01:
+                                continue
+                            try: client.futures_cancel_order(symbol=sym, orderId=_old['order_id'])
+                            except: pass
+                            _pending_fills.pop(sym, None)
+                            del _bb_limit_orders[sym]
+
+                        order = client.futures_create_order(symbol=sym, side='BUY', type='LIMIT',
+                            price=str(limit_px), quantity=str(qty), timeInForce='GTC')
+                        _bb_limit_orders[sym] = {'order_id': order['orderId'], 'price': limit_px, 'qty': qty, 'sl': sl, 'tp': tp}
+                        _pending_fills[sym] = {
+                            'order_id': order['orderId'], 'sl': sl, 'tp': tp,
+                            'side': 'BUY', 'entry': limit_px, 'score': 0, 'atr': atr,
+                            'time': time.time(), 'source': 'bb_box', 'expire': time.time() + 600,
+                        }
+                        log(f"  📦 BB 예약: {sym} @ {limit_px} (위치{best['bb_pos']:.0f}%) R:R=1:{_rr:.1f} MTF={_mtf}/3")
+                        send_message(TG_TOKEN, TG_CHAT,
+                            f"📦 <b>BB 예약 롱</b>\n   {sym} @ ${limit_px} (BB하단 대기)\n   MTF {_mtf}/3 | R:R 1:{_rr:.1f}")
+                        _placed += 1
                 except Exception as e:
-                    log(f"  ❌ BB 진입 실패: {e}")
+                    log(f"  ❌ BB 진입 ���패: {e}")
+
 
     except Exception as e:
         log(f"  BB 박스 오류: {e}")

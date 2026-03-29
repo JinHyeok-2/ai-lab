@@ -10,3 +10,9 @@
 {"time": "2026-03-29 11:05", "symbol": "TAOUSDT", "price": 316.15, "bb_width": 3.16, "bb_pos": 19.1, "rsi": 44, "signal": true}
 {"time": "2026-03-29 11:05", "symbol": "WLDUSDT", "price": 0.2698, "bb_width": 3.7, "bb_pos": -2.0, "rsi": 52, "signal": true}
 {"time": "2026-03-29 11:06", "symbol": "TAOUSDT", "price": 316.07, "bb_width": 3.18, "bb_pos": 18.6, "rsi": 44, "signal": true}
+{"time": "2026-03-29 13:02", "symbol": "WLDUSDT", "price": 0.2719, "bb_width": 3.7, "bb_pos": 19.0, "rsi": 51, "mtf_bottom": 2, "signal": true}
+{"time": "2026-03-29 13:13", "symbol": "WLDUSDT", "price": 0.2716, "bb_width": 3.7, "bb_pos": 16.0, "rsi": 50, "mtf_bottom": 2, "signal": true}
+{"time": "2026-03-29 13:14", "symbol": "WLDUSDT", "price": 0.2715, "bb_width": 3.7, "bb_pos": 15.0, "rsi": 50, "mtf_bottom": 2, "signal": true}
+{"time": "2026-03-29 13:14", "symbol": "WLDUSDT", "price": 0.2716, "bb_width": 3.7, "bb_pos": 16.0, "rsi": 50, "mtf_bottom": 2, "signal": true}
+{"time": "2026-03-29 13:15", "symbol": "WLDUSDT", "price": 0.2715, "bb_width": 3.7, "bb_pos": 15.0, "rsi": 50, "mtf_bottom": 2, "signal": true}
+{"time": "2026-03-29 13:20", "symbol": "WLDUSDT", "price": 0.2709, "bb_width": 3.7, "bb_pos": 9.0, "rsi": 49, "mtf_bottom": 2, "signal": true}
