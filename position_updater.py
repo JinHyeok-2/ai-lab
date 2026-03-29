@@ -2612,9 +2612,11 @@ def check_bb_box():
                         log(f"  ⏭ BB {sym} R:R {_tp_dist/_sl_dist:.1f} < 1.2 스킵")
                         continue
 
-                    # RL 앙상블 검증 — 관망이면 BB 진입 차단
-                    _rl_sig, _rl_bon = get_rl_signal_lite(sym)
-                    if _rl_sig == 'wait':
+                    # RL 앙상블 검증 — 관망이면 BB 진입 조건 강화
+                    _rl_sig, _ = get_rl_signal_lite(sym)
+                    if _rl_sig == 'long':
+                        log(f"  ✅ BB {sym} RL 롱 합의")
+                    elif _rl_sig == 'wait':
                         log(f"  ⏭ BB {sym} RL 관망 → 진입 차단")
                         continue
 
@@ -2822,9 +2824,9 @@ def check_cvd_divergence():
                 _today = datetime.now().strftime("%Y-%m-%d")
                 if _daily_trades.get("date") == _today and _daily_trades.get("count", 0) >= MAX_DAILY_TRADES:
                     break
-                log(f"  📊 CVD 다이��전스 감지: {sym} RSI={best['rsi']:.0f} CVD↑{best['cvd_delta']}%")
+                log(f"  📊 CVD 다이버전스 감지: {sym} RSI={best['rsi']:.0f} CVD↑{best['cvd_delta']}%")
 
-                # CVD 전용 ���입금 — $25 기본, 하락장 70%
+                # CVD 전용 진입금 — $25 기본, 하락장 70%
                 usdt = max(ALT_USDT * (0.7 if _bear_mode else 1.0), 12)
                 lev = ETH_LEV if sym == 'ETHUSDT' else ALT_LEV
                 try:
@@ -2839,9 +2841,9 @@ def check_cvd_divergence():
                         step, _ = _get_symbol_filters(sym)
                         qty = _round_qty(sym, 21.0 / limit_px + float(step))
                     if qty <= 0:
-                        return
+                        continue
 
-                    # ATR: 시그널 스캔���서 이미 계산한 값 재사용
+                    # ATR: 시그널 스캔에서 이미 계산한 값 재사용
                     atr = best.get('atr', 0) or 0
                     if atr <= 0:
                         _ind = calc_indicators(get_klines(sym, '1h', 50))
@@ -2852,12 +2854,6 @@ def check_cvd_divergence():
                     tp_pct = max(atr_pct * 5.0, sl_pct * 3.3)
                     sl = _round_price_sym(sym, limit_px * (1 - sl_pct / 100))  # SL/TP도 LIMIT 가격 기준
                     tp = _round_price_sym(sym, limit_px * (1 + tp_pct / 100))
-
-                    # RL 앙상블 검증 — 관망이면 CVD 진입 차단
-                    _rl_sig, _rl_bon = get_rl_signal_lite(sym)
-                    if _rl_sig == 'wait':
-                        log(f"  ⏭ CVD {sym} RL 관망 → 진입 차단")
-                        return
 
                     order = client.futures_create_order(
                         symbol=sym, side='BUY', type='LIMIT',
@@ -2886,7 +2882,7 @@ def check_cvd_divergence():
                     _institutional_post_entry(sym, 'cvd_divergence')
                     _entered += 1
                 except Exception as e:
-                log(f"  ❌ CVD 진입 실패: {e}")
+                    log(f"  ❌ CVD 진입 실패: {e}")
 
     except Exception as e:
         log(f"  CVD 오류: {e}")
