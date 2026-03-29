@@ -2090,17 +2090,17 @@ def _load_ensemble():
     try:
         from stable_baselines3 import PPO
         base = Path(__file__).parent / "rl-lab/models"
-        # ETH 모델 (v2: exp08→eth_seed800 교체, WF 4/4전승)
+        # ETH 모델 (v3: +v2s500 교체, +198.5%, MDD -1.7%, WF 3/4)
         eth_paths = {
             "exp14": base / "exp14/ppo_eth_30m.zip",
-            "seed700": base / "seed700/ppo_eth_30m.zip",
             "eth_seed800": base / "eth_seed800/ppo_eth_30m.zip",
+            "eth_v2s500": base / "eth_v2_seed500/ppo_eth_30m.zip",
         }
-        # BTC 모델
+        # BTC 모델 (v2: seed200+v2s400+v2s500, +84.4%, MDD -1.6%, WF 4/4)
         btc_paths = {
-            "btc_exp14": base / "btc_exp14/ppo_btc_30m.zip",
-            "btc_seed100": base / "btc_seed100/ppo_btc_30m.zip",
             "btc_seed200": base / "btc_seed200/ppo_btc_30m.zip",
+            "btc_v2s400": base / "btc_v2_seed400/ppo_btc_30m.zip",
+            "btc_v2s500": base / "btc_v2_seed500/ppo_btc_30m.zip",
         }
         # ALT 앙상블 (exp01+seed200+seed700, 다수결, WF 38/40)
         alt_paths = {
@@ -2114,14 +2114,14 @@ def _load_ensemble():
         eth_ok = all(p.exists() for p in eth_paths.values())
         if eth_ok:
             result["eth"] = {k: PPO.load(str(p)) for k, p in eth_paths.items()}
-            add_log(f"✅ ETH RL 앙상블 로드 (exp14+seed700+eth_seed800, 만장일치)")
+            add_log(f"✅ ETH RL 앙상블 로드 (exp14+eth_seed800+v2s500, 다수결)")
         else:
             add_log(f"⚠️ ETH RL 모델 누락")
         # BTC 로드
         btc_ok = all(p.exists() for p in btc_paths.values())
         if btc_ok:
             result["btc"] = {k: PPO.load(str(p)) for k, p in btc_paths.items()}
-            add_log(f"✅ BTC RL 앙상블 로드 (exp14+seed100+seed200, 다수결)")
+            add_log(f"✅ BTC RL 앙상블 로드 (seed200+v2s400+v2s500, 다수결)")
         else:
             add_log(f"⚠️ BTC RL 모델 누락")
         # ALT 로드 (3모델 앙상블)
