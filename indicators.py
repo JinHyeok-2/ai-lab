@@ -156,7 +156,7 @@ def calc_indicators(df: pd.DataFrame) -> dict:
 
     current_price = round(float(close.iloc[-1]), 2)
     prev_close    = round(float(close.iloc[-2]), 2)
-    change_pct    = round((current_price - prev_close) / prev_close * 100, 2)
+    change_pct    = round((current_price - prev_close) / prev_close * 100, 2) if prev_close else 0
 
     return {
         "price":       current_price,
