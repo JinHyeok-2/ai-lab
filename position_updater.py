@@ -102,9 +102,13 @@ MIN_HOLD_SEC = 600  # 10분
 _entry_time = {}  # {symbol: time.time()}
 _entry_source = {}  # {symbol: 'cvd_divergence' 등} — 전략별 보유시간 차등
 
+# ── 볼린저 박스 왕복 전략 ──
+_bb_box_cache = {'ts': 0}
+BB_BOX_LOG = '/home/hyeok/01.APCC/00.ai-lab/bb_box_signals.jsonl'
+
 # ── 기관 매매법 전략 변수 ──
 # #L: CVD 다이버전스
-_cvd_cache = {'ts': 0}  # 10분 캐시
+_cvd_cache = {'ts': 0}  # 5분 캐시
 CVD_LOG = '/home/hyeok/01.APCC/00.ai-lab/cvd_signals.jsonl'
 # #M: OI + 롱숏비율 콤보 (숏 스퀴즈)
 _squeeze_cache = {'ts': 0}
@@ -1032,9 +1036,7 @@ def check_partial_tp():
 
                     try:
                         send_message(TG_TOKEN, TG_CHAT,
-                            f"💰 <b>{sym} 부분 익절!</b>\n"
-                            f"   절반 청산 {half_qty} (수익 {pnl_real:.1f}% real)\n"
-                            f"   SL → 본절 ${entry}")
+                            f"💰 {sym} 절반 익절 +{pnl_real:.1f}% | SL→본절")
                     except Exception:
                         pass
                 except Exception as e:
@@ -1354,7 +1356,10 @@ def check_long_hold():
 
             # #T: 강제 청산 — CVD는 12h (기관 매집 후 천천히 상승), 나머지 6h
             _source = _entry_source.get(sym, 'updater')
-            _max_hold = 12 * 3600 if _source == 'cvd_divergence' else 6 * 3600
+            # CVD 12h, BB 박스 4h (횡보장 빠른 회전), 나머지 6h
+            if _source == 'cvd_divergence': _max_hold = 12 * 3600
+            elif _source == 'bb_box': _max_hold = 4 * 3600
+            else: _max_hold = 6 * 3600
             if held_sec >= _max_hold:
                 trend_broken = True
                 reason = f"{_max_hold//3600}h+ 강제 ({held_h:.1f}h)"
@@ -2449,6 +2454,193 @@ def _institutional_post_entry(sym, source):
     _daily_trades['count'] += 1
     _cooldown[sym] = time.time() + COOLDOWN_SEC
 
+def check_bb_box():
+    """
+    볼린저 박스 왕복 — 횡보장에서 하단 매수 → 상단 청산
+    조건: BB 폭 < 3% (박스권) + 가격이 하단 근처 + RSI 35~55 (과매도 아닌 횡보)
+    """
+    global _bb_box_cache
+    now = time.time()
+    if now - _bb_box_cache['ts'] < 300:  # 5분
+        return
+    _bb_box_cache['ts'] = now
+
+    ok, reason = _institutional_guard()
+    if not ok:
+        return
+
+    try:
+        client = get_client()
+        held = get_held_symbols()
+        if len(held) >= MAX_ORDERS:
+            return
+
+        _bb_exclude = {'SOLUSDT', 'BTCUSDT'}  # 대형은 제외
+        symbols = [s for s in get_scan_universe() if s not in _bb_exclude]
+        signals = []
+
+        for sym in symbols:
+            if sym in held or sym in BLACKLIST:
+                continue
+            if sym in _cooldown and time.time() < _cooldown[sym]:
+                continue
+
+            try:
+                ind = calc_indicators(get_klines(sym, '1h', 50))
+                bb_upper = ind.get('bb_upper', 0) or 0
+                bb_lower = ind.get('bb_lower', 0) or 0
+                bb_mid = ind.get('bb_mid', 0) or 0
+                rsi = ind.get('rsi', 50) or 50
+                atr = ind.get('atr', 0) or 0
+                if rsi != rsi: continue  # nan
+                px = float(get_price(sym))
+
+                if not (bb_upper > bb_lower > 0 and px > 0):
+                    continue
+
+                # 박스 폭 (%)
+                bb_width = (bb_upper - bb_lower) / bb_mid * 100 if bb_mid else 0
+
+                # 가격의 밴드 내 위치 (0%=하단, 100%=상단)
+                bb_pos = (px - bb_lower) / (bb_upper - bb_lower) * 100
+
+                # 조건: 박스권(폭 1~4%) + 하단 근처(20% 이하) + RSI 횡보(30~55)
+                is_box = 1.0 < bb_width < 4.0
+                is_near_bottom = bb_pos < 20
+                is_sideways_rsi = 30 < rsi < 55
+
+                is_signal = is_box and is_near_bottom and is_sideways_rsi
+
+                # 로그
+                if is_box and (is_near_bottom or rsi < 40):
+                    try:
+                        with open(BB_BOX_LOG, 'a') as f:
+                            f.write(json.dumps({
+                                "time": datetime.now().strftime('%Y-%m-%d %H:%M'),
+                                "symbol": sym, "price": px,
+                                "bb_width": round(bb_width, 2),
+                                "bb_pos": round(bb_pos, 1),
+                                "rsi": round(rsi),
+                                "signal": is_signal,
+                            }) + '\n')
+                    except Exception:
+                        pass
+
+                if is_signal:
+                    signals.append({
+                        'symbol': sym, 'price': px, 'rsi': rsi,
+                        'bb_width': bb_width, 'bb_pos': bb_pos,
+                        'bb_upper': bb_upper, 'bb_lower': bb_lower,
+                        'bb_mid': bb_mid, 'atr': atr,
+                    })
+
+            except Exception as _e:
+                log(f"  ⚠️ BB {sym} 스캔 오류: {str(_e)[:60]}")
+                continue
+
+        # 밴드 위치 가장 낮은 것 (바닥에 가장 가까운 것) 최대 2개
+        if signals and len(held) < MAX_ORDERS:
+            ranked = sorted(signals, key=lambda x: x['bb_pos'])
+            _max_entry = min(2, MAX_ORDERS - len(held))
+            _entered = 0
+
+            for best in ranked:
+                if _entered >= _max_entry:
+                    break
+                sym = best['symbol']
+                if _check_already_held(sym):
+                    continue
+                log(f"  📦 BB 박스 감지: {sym} 폭={best['bb_width']:.1f}% 위치={best['bb_pos']:.0f}% RSI={best['rsi']:.0f}")
+
+                usdt = max(ALT_USDT * (0.7 if _bear_mode else 1.0), 12)
+                lev = ETH_LEV if sym == 'ETHUSDT' else ALT_LEV
+                try:
+                    set_margin_type(sym, "ISOLATED")
+                    set_leverage(sym, lev)
+                    px = float(get_price(sym))
+
+                    qty = _round_qty(sym, usdt * lev / px)
+                    if qty <= 0 or qty * px < 20:
+                        step, _ = _get_symbol_filters(sym)
+                        qty = _round_qty(sym, 21.0 / px + float(step))
+                    if qty <= 0:
+                        continue
+
+                    # SL: ATR 기반 (좁은 박스에서도 적정 거리), TP: 상단 -0.3%
+                    atr = best.get('atr', 0) or 0
+                    atr_pct = atr / px * 100 if px else 1
+                    sl_pct = max(atr_pct * 1.5, 1.0 / lev)
+                    sl = _round_price_sym(sym, px * (1 - sl_pct / 100))
+                    tp = _round_price_sym(sym, best['bb_upper'] * 0.997)  # 상단 -0.3%
+
+                    # R:R 최소 1.2 보장
+                    _sl_dist = abs(px - sl)
+                    _tp_dist = abs(tp - px)
+                    if _sl_dist > 0 and _tp_dist / _sl_dist < 1.2:
+                        log(f"  ⏭ BB {sym} R:R {_tp_dist/_sl_dist:.1f} < 1.2 스킵")
+                        continue
+
+                    # 시장가 진입 (하단 근처에서 바로 진입 + SL/TP 즉시 배치)
+                    order = client.futures_create_order(
+                        symbol=sym, side='BUY', type='MARKET',
+                        quantity=str(qty))
+                    _positions_cache['ts'] = 0  # 캐시 리셋
+
+                    # SL/TP 즉시 배치
+                    close_side = 'SELL'
+                    _sl_ok = _tp_ok = False
+                    try:
+                        client.futures_create_order(
+                            symbol=sym, side=close_side, type='STOP_MARKET',
+                            stopPrice=str(sl), quantity=str(qty), reduceOnly=True)
+                        _sl_ok = True
+                    except Exception as _se:
+                        log(f"  ⚠️ BB {sym} SL 배치 실패: {_se}")
+                    try:
+                        client.futures_create_order(
+                            symbol=sym, side=close_side, type='TAKE_PROFIT_MARKET',
+                            stopPrice=str(tp), quantity=str(qty), reduceOnly=True)
+                        _tp_ok = True
+                    except Exception as _te:
+                        log(f"  ⚠️ BB {sym} TP 배치 실패: {_te}")
+
+                    # SL 실패 시 즉시 청산 (보호)
+                    if not _sl_ok:
+                        try:
+                            client.futures_create_order(
+                                symbol=sym, side=close_side, type='MARKET',
+                                quantity=str(qty), reduceOnly=True)
+                            log(f"  🚨 BB {sym} SL 미배치 → 즉시 청산")
+                            continue
+                        except: pass
+
+                    _sltp_done.add(sym)
+                    _tp_cache[sym] = tp
+                    _entry_time[sym] = time.time()
+                    _entry_source[sym] = 'bb_box'
+
+                    entry_px = px  # 시장가 진입가 ≈ 현재가
+                    trade_db.add_trade({"symbol": sym, "side": "🟢 롱", "action": "진입",
+                                        "qty": qty, "price": entry_px, "sl": sl, "tp": tp,
+                                        "source": "bb_box",
+                                        "extra": json.dumps({"bb_width": round(best['bb_width'], 1), "bb_pos": round(best['bb_pos'], 0)})})
+                    _rr = _tp_dist / _sl_dist if _sl_dist else 0
+                    log(f"  ✅ BB 박스 롱: {sym} @ {entry_px} SL={sl}({sl_pct:.1f}%) TP={tp} R:R=1:{_rr:.1f}")
+                    send_message(TG_TOKEN, TG_CHAT,
+                        f"📦 <b>BB 박스 롱</b>\n"
+                        f"   {sym} @ ${entry_px}\n"
+                        f"   박스 {best['bb_lower']:.4f}~{best['bb_upper']:.4f} (폭{best['bb_width']:.1f}%)\n"
+                        f"   SL ${sl} ({sl_pct:.1f}%) → TP ${tp}\n"
+                        f"   R:R 1:{_rr:.1f} | {'SL✅TP✅' if _sl_ok and _tp_ok else 'SL/TP 확인필요'}")
+                    _institutional_post_entry(sym, 'bb_box')
+                    _entered += 1
+                except Exception as e:
+                    log(f"  ❌ BB 진입 실패: {e}")
+
+    except Exception as e:
+        log(f"  BB 박스 오류: {e}")
+
+
 def check_cvd_divergence():
     """
     #L: CVD 다이버전스 — 가격 저점 갱신 but 매수 누적 증가 = 기관 매집
@@ -3518,8 +3710,9 @@ def update_cycle():
     # scan_listing_announcements()
     # check_listing_short()
 
-    # CVD만 활성화 (20건 55% +$1.39 유일한 흑자)
-    check_cvd_divergence()       # #L: CVD 다이버전스
+    # 활성 전략: CVD + BB 박스
+    check_cvd_divergence()       # #L: CVD 다이버전스 (하락장 바닥)
+    check_bb_box()               # BB 박스 왕복 (횡보장 하단 매수)
 
     # 나머지 기관 전략 OFF (데이터 축적 후 재검토)
     # check_short_squeeze()        # #M
@@ -3601,6 +3794,56 @@ def check_extreme_funding():
             time.sleep(0.1)
     except Exception as e:
         log(f"  펀딩비 감지 오류: {e}")
+
+
+_sltp_verify_ts = 0  # 마지막 검증 시각
+
+def verify_sltp():
+    """포지션 보유 중인데 SL/TP 없는 것 감지 → 즉시 재배치 (2분마다)"""
+    global _sltp_verify_ts
+    now = time.time()
+    if now - _sltp_verify_ts < 120:  # 2분 간격
+        return
+    _sltp_verify_ts = now
+
+    try:
+        client = get_client()
+        for pos in _get_positions_cached():
+            sym = pos['symbol']
+            entry = float(pos.get('entry_price', 0))
+            qty = float(pos.get('size', 0))
+            if entry <= 0 or qty <= 0:
+                continue
+
+            # SL 존재 확인: 중복 배치 시도
+            try:
+                client.futures_create_order(
+                    symbol=sym, side='SELL', type='STOP_MARKET',
+                    stopPrice=str(_round_price_sym(sym, entry * 0.5)),  # 더미 가격
+                    quantity=str(qty), reduceOnly=True)
+                # 성공 = SL 없었음 → 취소 후 적정 SL 배치
+                orders = client.futures_get_open_orders(symbol=sym)
+                for o in orders:
+                    if o['type'] == 'STOP_MARKET' and abs(float(o['stopPrice']) - entry * 0.5) < entry * 0.01:
+                        client.futures_cancel_order(symbol=sym, orderId=o['orderId'])
+
+                # ATR 기반 SL 재배치
+                _ind = calc_indicators(get_klines(sym, '1h', 50))
+                atr = _ind.get('atr', 0) or 0
+                lev = 3 if sym in ('ETHUSDT', 'BTCUSDT') else 2
+                atr_pct = atr / entry * 100 if entry else 1
+                sl_pct = max(atr_pct * 1.5, 2.0 / lev)
+                sl = _round_price_sym(sym, entry * (1 - sl_pct / 100))
+                client.futures_create_order(
+                    symbol=sym, side='SELL', type='STOP_MARKET',
+                    stopPrice=str(sl), quantity=str(qty), reduceOnly=True)
+                log(f"  🔧 {sym} SL 누락 감지 → 재배치 SL={sl}")
+                send_message(TG_TOKEN, TG_CHAT, f"🔧 {sym} SL 누락 → 재배치 ${sl}")
+            except Exception as e:
+                if '4130' in str(e):
+                    pass  # SL 이미 존재 — 정상
+    except Exception as e:
+        log(f"  SL/TP 검증 오류: {e}")
 
 
 _last_daily_report = ""
@@ -3724,8 +3967,12 @@ def main():
                     if _row and _row[0] is not None:
                         if _row[0] <= 0:
                             _consecutive_losses += 1
-                            _cooldown[sym] = time.time() + COOLDOWN_LOSS_SEC  # 손실 → 2시간 쿨다운
-                            # #K: 하락장 일일 손실 누적
+                            _cooldown[sym] = time.time() + COOLDOWN_LOSS_SEC
+                            # SL 히트 알림
+                            try:
+                                send_message(TG_TOKEN, TG_CHAT,
+                                    f"❌ {sym} 손절 ${_row[0]:+.2f} | 연속 {_consecutive_losses}패")
+                            except: pass
                             if _bear_mode:
                                 _bear_daily_loss['total'] += abs(_row[0])
                                 if _bear_daily_loss['total'] >= 3.0:
@@ -3733,10 +3980,9 @@ def main():
                                     log(f"  🛑 하락장 일일 손실 ${_bear_daily_loss['total']:.2f} ≥ $3 → 당일 정지")
                                     try:
                                         send_message(TG_TOKEN, TG_CHAT,
-                                            f"🛑 <b>하락장 일일 손실 한도!</b>\n"
-                                            f"   누적 ${_bear_daily_loss['total']:.2f} ≥ $3 → 당일 거래 정지")
+                                            f"🛑 하락장 손실 한도 ${_bear_daily_loss['total']:.2f} → 당일 정지")
                                     except: pass
-                            log(f"  ⏳ {sym} 손절 → 연속 {_consecutive_losses}패 | {COOLDOWN_LOSS_SEC//60}분 쿨다운 (손실 강화)")
+                            log(f"  ⏳ {sym} 손절 → 연속 {_consecutive_losses}패 | {COOLDOWN_LOSS_SEC//60}분 쿨다운")
                         else:
                             _consecutive_losses = 0
                             log(f"  ⏳ {sym} 익절 → 연패 리셋 | {COOLDOWN_SEC//60}분 쿨다운")
@@ -3796,8 +4042,9 @@ def main():
             time.sleep(30)
             try:
                 _positions_cache['ts'] = 0  # 캐시 리셋
-                check_fills()  # LIMIT 체결 감지 → SL/TP 즉시 배치 (5분→30초)
+                check_fills()  # LIMIT 체결 감지 → SL/TP 즉시 배치
                 check_trailing_stop()
+                verify_sltp()  # SL/TP 누락 자동 감지 + 재배치 (2분마다)
             except Exception:
                 pass
 
