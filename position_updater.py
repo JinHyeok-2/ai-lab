@@ -9,6 +9,7 @@ import os
 import time
 import math
 import json
+import uuid
 import sqlite3
 from datetime import datetime, timezone, timedelta
 from binance_client import (get_klines, get_price, get_balance, get_positions,
@@ -25,9 +26,9 @@ import trade_db
 
 # ── 설정 ──
 INTERVAL = 300          # 5분
-MAX_ORDERS = 4          # 동시 최대 주문 수 (3→4, 분산 효과)
-ETH_USDT = 25           # ETH 진입금 (15→25, CVD 단독 운영 — 목표 $100)
-ALT_USDT = 25           # 알트 진입금 (15→25)
+MAX_ORDERS = 2          # 4→2 (보수적: 집중 투자)
+ETH_USDT = 30           # ETH 진입금 (25→30, 1%/일 목표)
+ALT_USDT = 30           # 알트 진입금 (25→30, BB 건당 수익 강화)
 ALT_USDT_MAX = 60       # 노셔널 상한 (ETH $20×3x=60, ALT $20×2x=40)
 ETH_LEV = 3             # ETH 레버리지
 ALT_LEV = 2             # 알트 레버리지
@@ -35,12 +36,14 @@ MIN_SCORE = 6           # 최소 진입 점수 (5→6: 그리드서치 1위, 노
 MAX_SL_PCT = 5.0        # SL 최대 거리 (%)
 MAX_LOSS_PER_TRADE = 1.0  # #141 건당 최대 손실 캡 $1.0 (수량 조절 방식)
 MAX_SAME_DIR = 4        # 동일 방향 최대 (2→4, 롱전용이므로 MAX_ORDERS와 동일)
-MAX_DAILY_TRADES = 5    # 하루 최대 거래 횟수 (8→5, 15건 이하 수익 구간)
-NIGHT_HOURS = {0, 1, 2, 3, 4, 21, 22, 23}  # #H: 야간 진입 차단 확대 (21~04시 KST, 21시 6건전패 반영)
+MAX_DAILY_TRADES = 4    # 3→4 (BB 기회 확보, 1%/일 목표)
+NIGHT_HOURS = set()  # 야간 차단 해제 — 데이터 축적 후 재판단 (암호화폐 24시간 글로벌 시장)
 BLACKLIST = {'BRUSDT', 'SIRENUSDT', 'XAUUSDT', 'XAGUSDT', 'RIVERUSDT', 'SIGNUSDT', 'PAXGUSDT', 'BSBUSDT',
              'A2ZUSDT', 'PTBUSDT', 'VIDTUSDT', 'MEMEFIUSDT', 'AMBUSDT', 'TROYUSDT', 'LEVERUSDT', 'NOMUSDT',
              'PORT3USDT', 'NEIROETHUSDT', 'BSWUSDT', 'AGIXUSDT', 'SXPUSDT',
-             'ALPACAUSDT', 'BNXUSDT', 'ALPHAUSDT'}  # + get_price 에러
+             'ALPACAUSDT', 'BNXUSDT', 'ALPHAUSDT', 'LINAUSDT'}  # + get_price 에러
+# 성과 기반 위험 종목 (승률 0~33%) — BB/CVD 진입 제외
+WEAK_SYMBOLS = {'ETHUSDT', 'DOGEUSDT', 'ONTUSDT', 'TAOUSDT'}  # ETH 0%, DOGE 0%, ONT 0%, TAO 33%
 TG_TOKEN = TELEGRAM_TOKEN
 TG_CHAT  = TELEGRAM_CHAT_ID
 
@@ -109,6 +112,19 @@ _entry_source = {}  # {symbol: 'cvd_divergence' 등} — 전략별 보유시간 
 _bb_box_cache = {'ts': 0}
 _bb_limit_orders = {}  # {symbol: {'order_id': ..., 'price': ..., 'qty': ..., 'sl': ..., 'tp': ...}}
 BB_BOX_LOG = '/home/hyeok/01.APCC/00.ai-lab/bb_box_signals.jsonl'
+# ── BB 숏 (상단 매도) ──
+_bb_short_cache = {'ts': 0}
+_bb_short_limit_orders = {}  # {symbol: {'order_id': ..., ...}}
+BB_SHORT_USDT = 20  # 롱보다 보수적
+BB_SHORT_LOG = '/home/hyeok/01.APCC/00.ai-lab/bb_short_signals.jsonl'
+# ── 추세 추종 숏 (하락장) ──
+_trend_short_cache = {'ts': 0}
+TREND_SHORT_USDT = 20
+TREND_SHORT_LOG = '/home/hyeok/01.APCC/00.ai-lab/trend_short_signals.jsonl'
+# ── 역행 과매수 숏 (하락장에서 혼자 오른 알트) ──
+_contrarian_short_cache = {'ts': 0}
+CONTRARIAN_SHORT_USDT = 25
+CONTRARIAN_SHORT_LOG = '/home/hyeok/01.APCC/00.ai-lab/contrarian_short_signals.jsonl'
 
 # ── 기관 매매법 전략 변수 ──
 # #L: CVD 다이버전스
@@ -909,7 +925,7 @@ def check_fills():
                             "sl": info['sl'], "tp": info['tp'],
                             "atr": info.get('atr', 0),
                             "confidence": abs(info.get('score', 0)),
-                            "source": "updater",
+                            "source": info.get('source', 'updater'),
                             "extra": json.dumps({"score": info.get('score',0), "btc_up": _btc_cache.get('up', True), "btc_rsi": round(_btc_cache.get('rsi', 50)), "rl": info.get('rl_signal', 'none')}),
                         })
                     except Exception:
@@ -937,6 +953,8 @@ def check_fills():
             log(f"  ⏰ {sym} 미체결 만료 → 주문 취소")
         except: pass
         del _pending_fills[sym]
+        _bb_limit_orders.pop(sym, None)  # BB 롱 예약도 동시 정리
+        _bb_short_limit_orders.pop(sym, None)  # BB 숏 예약도 동시 정리
 
     # 2. 재시작 시 기존 포지션 SL/TP 1회 보완 (_sltp_done 비어있으면 실행)
     try:
@@ -950,16 +968,23 @@ def check_fills():
             side_str = pos.get('side', 'LONG')
             if entry > 0 and qty > 0:
                 # 1회만 시도 후 _sltp_done 등록 (algo 주문은 API에서 조회 불가 → 중복 방지)
-                i1h = calc_indicators(get_klines(sym, '1h', 60))
-                atr = i1h.get('atr', 0) or 0
-                if atr > 0:
-                    is_long = 'LONG' in side_str.upper()
+                is_long = 'LONG' in side_str.upper()
+                close_side = 'SELL' if is_long else 'BUY'
+                # BB 포지션: DB에서 원래 SL/TP 복원 (ATR 기반 덮어쓰기 방지)
+                _src = _entry_source.get(sym, 'updater')
+                _db_trade = trade_db.get_open_trades(sym)
+                if _db_trade and _src in ('bb_box', 'bb_short'):
+                    sl = _db_trade[0].get('sl', 0)
+                    tp = _db_trade[0].get('tp', 0)
+                else:
+                    i1h = calc_indicators(get_klines(sym, '1h', 60))
+                    atr = i1h.get('atr', 0) or 0
                     lev = 3 if sym == 'ETHUSDT' else 2
-                    sl_m = 2.0  # 그리드서치 최적값
-                    tp_m = 5.0  # 그리드서치 최적값
-                    sl = round(entry - atr * sl_m, 6) if is_long else round(entry + atr * sl_m, 6)
-                    tp = round(entry + atr * tp_m, 6) if is_long else round(entry - atr * tp_m, 6)
-                    close_side = 'SELL' if is_long else 'BUY'
+                    sl_m = 2.0
+                    tp_m = 3.0
+                    sl = _round_price_sym(sym, entry - atr * sl_m) if is_long else _round_price_sym(sym, entry + atr * sl_m)
+                    tp = _round_price_sym(sym, entry + atr * tp_m) if is_long else _round_price_sym(sym, entry - atr * tp_m)
+                if sl and tp:
                     # 1회 배치 (4130이면 이미 존재 → 무시)
                     try:
                         client.futures_create_order(symbol=sym, side=close_side, type='STOP_MARKET',
@@ -971,7 +996,18 @@ def check_fills():
                     except: pass
                     _sltp_done.add(sym)
                     _tp_cache[sym] = tp
-                    log(f"  🔧 {sym} SL/TP 보완: SL ${sl} TP ${tp}")
+                    # DB에 미기록 포지션 → 진입 기록 추가 (재시작 시 BB LIMIT 체결 등)
+                    _existing = trade_db.get_open_trades(sym)
+                    if not _existing:
+                        _side_label = "🟢 롱" if is_long else "🔴 숏"
+                        trade_db.add_trade({
+                            "symbol": sym, "side": _side_label, "action": "진입",
+                            "qty": qty, "price": entry, "sl": sl, "tp": tp,
+                            "source": _entry_source.get(sym, 'updater'),
+                        })
+                        log(f"  🔧 {sym} SL/TP 보완 + DB 기록: SL ${sl} TP ${tp} src={_entry_source.get(sym, 'updater')}")
+                    else:
+                        log(f"  🔧 {sym} SL/TP 보완: SL ${sl} TP ${tp}")
     except Exception as e:
         log(f"  SL/TP 보완 오류: {e}")
 
@@ -984,6 +1020,9 @@ def check_partial_tp():
         for pos in _get_positions_cached():
             sym = pos['symbol']
             if sym in _partial_done:
+                continue
+            # BB/추세숏: 전량 TP → 부분 익절 불필요
+            if _entry_source.get(sym) in ('bb_box', 'bb_short', 'trend_short', 'contrarian_short'):
                 continue
             entry = float(pos.get('entry_price', 0))
             qty = float(pos.get('size', 0))
@@ -1036,12 +1075,12 @@ def check_partial_tp():
                         # 본절 SL + 기존 TP — STOP_MARKET 통일
                         try:
                             client.futures_create_order(symbol=sym, side=close_side2, type='STOP_MARKET',
-                                stopPrice=str(round(entry, 2 if entry > 100 else (4 if entry > 1 else 6))),
+                                stopPrice=str(_round_price_sym(sym, entry)),
                                 quantity=str(remain), reduceOnly=True)
                         except: pass
                         try:
                             client.futures_create_order(symbol=sym, side=close_side2, type='TAKE_PROFIT_MARKET',
-                                stopPrice=str(round(tp, 2 if tp > 100 else (4 if tp > 1 else 6))),
+                                stopPrice=str(_round_price_sym(sym, tp)),
                                 quantity=str(remain), reduceOnly=True)
                         except: pass
                         log(f"  🔒 {sym} SL → 본절 ${entry}, 잔여 {remain}")
@@ -1157,6 +1196,9 @@ def check_trailing_stop():
             side = pos.get('side', 'LONG')
             if entry <= 0 or qty <= 0:
                 continue
+            # BB/추세숏: 전량 TP에 의존 → 트레일링 스킵
+            if _entry_source.get(sym) in ('bb_box', 'bb_short', 'trend_short', 'contrarian_short'):
+                continue
 
             cur = get_price(sym)
             is_long = 'LONG' in side.upper()
@@ -1259,9 +1301,14 @@ def check_stale_position():
             if entry <= 0 or qty <= 0:
                 continue
 
-            # 2시간 이상 보유 확인
+            # 2시간 이상 보유 확인 (BB 박스는 횡보장이라 느린 이동 정상 → 4시간)
+            _src = _entry_source.get(sym, 'updater')
+            # CVD는 큰 수익 평균 10h → stale 조임 6h로 여유. BB/추세 4h, 나머지 2h
+            if _src == 'cvd_divergence': _stale_sec = 21600  # 6h
+            elif _src in ('bb_box', 'bb_short', 'trend_short', 'contrarian_short'): _stale_sec = 14400  # 4h
+            else: _stale_sec = 7200  # 2h
             held_sec = now - _entry_time.get(sym, now)
-            if held_sec < 7200:  # 2시간 미만 스킵
+            if held_sec < _stale_sec:
                 continue
 
             # 이미 조임 완료면 스킵
@@ -1291,8 +1338,10 @@ def check_stale_position():
             prec = 2 if cur > 100 else (4 if cur > 1 else 6)
             new_sl = round(new_sl, prec)
 
-            # 기존 SL보다 타이트할 때만 조임
+            # 기존 SL보다 타이트할 때만 조임 (롱: SL 올리기, 숏: SL 내리기)
             if is_long and old_sl > 0 and new_sl <= old_sl:
+                continue
+            if not is_long and old_sl > 0 and new_sl >= old_sl:
                 continue
 
             # SL 교체
@@ -1335,8 +1384,7 @@ def check_long_hold():
                 continue
 
             is_long = 'LONG' in side.upper()
-            if not is_long:
-                continue
+            # 숏도 지원 (bb_short) — 롱 전용 제한 제거
 
             # #I: 보유시간 확인 (하락장 2h / 일반 4h)
             held_sec = now - _entry_time.get(sym, now)
@@ -1370,9 +1418,9 @@ def check_long_hold():
 
             # #T: 강제 청산 — CVD는 12h (기관 매집 후 천천히 상승), 나머지 6h
             _source = _entry_source.get(sym, 'updater')
-            # CVD 12h, BB 박스 4h (횡보장 빠른 회전), 나머지 6h
+            # CVD 12h, BB/추세숏 8h, 나머지 6h
             if _source == 'cvd_divergence': _max_hold = 12 * 3600
-            elif _source == 'bb_box': _max_hold = 4 * 3600
+            elif _source in ('bb_box', 'bb_short', 'trend_short', 'contrarian_short'): _max_hold = 8 * 3600
             else: _max_hold = 6 * 3600
             if held_sec >= _max_hold:
                 trend_broken = True
@@ -1385,12 +1433,13 @@ def check_long_hold():
             cur = get_price(sym)
             is_major = sym in ('ETHUSDT', 'BTCUSDT')
             lev = 3 if is_major else 2
-            pnl_real = (cur - entry) / entry * 100 * lev
+            pnl_real = ((cur - entry) / entry * 100 * lev) if is_long else ((entry - cur) / entry * 100 * lev)
 
-            # 시장가 청산
+            # 시장가 청산 (롱→SELL, 숏→BUY)
+            _close_side = 'SELL' if is_long else 'BUY'
             try:
                 client.futures_create_order(
-                    symbol=sym, side='SELL', type='MARKET',
+                    symbol=sym, side=_close_side, type='MARKET',
                     quantity=qty, reduceOnly=True)
                 _positions_cache['ts'] = 0
                 # SL/TP 정리
@@ -2433,23 +2482,42 @@ def check_listing_short():
 # ═══════════════════════════════════════════════════════════
 
 def _institutional_guard():
-    """기관 전략 공통 가드 — 야간/일일한도 체크 (updater와 한도 통합)"""
+    """기관 전략 공통 가드 — 야간/일일한도/마진 체크"""
     kst_hour = (datetime.now(tz=timezone.utc).hour + 9) % 24
     if kst_hour in NIGHT_HOURS:
         return False, "야간"
-    # 일일 한도: updater + 기관 전략 통합 카운트
     today = datetime.now().strftime('%Y-%m-%d')
     if _daily_trades.get('date') == today and _daily_trades.get('count', 0) >= MAX_DAILY_TRADES:
         return False, "일일 한도"
+    # 마진 사전 체크: 가용 잔고 < $36이면 진입 불가 (CVD $35 + 수수료 여유)
+    try:
+        _bal = get_balance()
+        if isinstance(_bal, dict):
+            _avail = float(_bal.get('available', 0) or 0)
+        else:
+            _avail = float(_bal or 0)
+        if _avail < 36:
+            return False, f"마진부족(${_avail:.0f})"
+    except: pass
     return True, ""
 
 
 def _check_already_held(sym):
-    """같은 종목 다전략 진입 차단 — 포지션 or pending 있으면 True"""
+    """같은 종목 다전략 진입 차단 — 포지션/pending/예약/연패 체크"""
     if has_position(sym):
         return True
     if sym in _pending_fills:
         return True
+    if sym in _bb_limit_orders:
+        return True
+    if sym in _bb_short_limit_orders:
+        return True
+    # 동일 종목 2연패 시 스킵 (더 확실한 기회 대기)
+    try:
+        _recent = trade_db.get_recent_trades_by_symbol(sym, limit=2)
+        if len(_recent) >= 2 and all(t['pnl'] <= 0 for t in _recent):
+            return True
+    except: pass
     return False
 
 
@@ -2466,7 +2534,9 @@ def _institutional_post_entry(sym, source):
         _daily_trades['date'] = today
         _daily_trades['count'] = 0
     _daily_trades['count'] += 1
-    _cooldown[sym] = time.time() + COOLDOWN_SEC
+    # BB 박스 롱/숏: 15분 쿨다운 (횡보장 왕복 재진입 허용), 나머지: 30분
+    _cd = 900 if source in ('bb_box', 'bb_short', 'trend_short', 'contrarian_short') else COOLDOWN_SEC
+    _cooldown[sym] = time.time() + _cd
 
 def check_bb_box():
     """
@@ -2483,18 +2553,23 @@ def check_bb_box():
     if not ok:
         return
 
+    # 하락장 필터: BTC RSI < 40 + ADX > 25이면 BB 롱 스킵 (역추세 방지)
+    _btc_rsi = _btc_cache.get('rsi', 50)
+    if _btc_rsi < 50:  # 40→50 (BTC가 중립 이상일 때만 롱)
+        return
+
     try:
         client = get_client()
         held = get_held_symbols()
         if len(held) >= MAX_ORDERS:
             return
 
-        _bb_exclude = {'SOLUSDT', 'BTCUSDT'}  # 대형은 제외
+        _bb_exclude = {'BTCUSDT'}  # BTC만 제외 (SOL은 BB 폭 필터로 자동 조절)
         symbols = [s for s in get_scan_universe() if s not in _bb_exclude]
         signals = []
 
         for sym in symbols:
-            if sym in held or sym in BLACKLIST:
+            if sym in held or sym in BLACKLIST or sym in WEAK_SYMBOLS:
                 continue
             if sym in _cooldown and time.time() < _cooldown[sym]:
                 continue
@@ -2535,9 +2610,9 @@ def check_bb_box():
                 if rsi != rsi: continue  # nan
 
                 # 조건: 1h 박스권(폭 1~4%) + 2/3 TF 하단 합의 + RSI 횡보(30~55)
-                is_box = 1.0 < bb_width < 4.0
-                is_mtf_bottom = _bb_bottom_count >= 2  # 15m/30m/1h 중 2개+ 하단
-                is_sideways_rsi = 30 < rsi < 55
+                is_box = 1.5 < bb_width < 5.5  # 백테스트 1위: 1.5~5.5%
+                is_mtf_bottom = _bb_bottom_count >= 3  # 3/3 전 TF 합의 (보수적)
+                is_sideways_rsi = 30 < rsi < 55  # 백테스트 1위: 55
 
                 is_signal = is_box and is_mtf_bottom and is_sideways_rsi
 
@@ -2611,15 +2686,28 @@ def check_bb_box():
                     atr_pct = atr / px * 100 if px else 1
                     if atr_pct < 0.5:
                         atr_pct = 1.0
-                    sl_pct = max(atr_pct * 1.5, 1.5 / lev)
-                    tp = _round_price_sym(sym, best['bb_upper'] * 0.997)
+                    # #A: SL을 BB 하단 -0.5%로 고정 (박스 이탈 시에만 손절)
+                    sl_pct_bb = abs(px - best['bb_lower']) / px * 100 + 0.5
+                    sl_pct = max(sl_pct_bb, 1.5 / lev)  # 최소 레버리지 보호
+                    # TP를 BB 상단 (백테스트 1위: upper가 mid보다 +$14.63)
+                    tp = _round_price_sym(sym, best['bb_upper'])
                     if best['bb_upper'] <= px * 1.01:
                         continue
                     _mtf = best.get('mtf_bottom', 0)
 
                     # === 위치 < 10%: 시장가 즉시 ===
                     if best['bb_pos'] < 10:
-                        sl = _round_price_sym(sym, px * (1 - sl_pct / 100))
+                        # 기존 LIMIT 예약 있으면 취소 후 시장가 전환
+                        if sym in _bb_limit_orders:
+                            try: client.futures_cancel_order(symbol=sym, orderId=_bb_limit_orders[sym]['order_id'])
+                            except: pass
+                            _pending_fills.pop(sym, None)
+                            del _bb_limit_orders[sym]
+                        _sl_bb = best['bb_lower'] * 0.997
+                        _atr_sl = best.get('atr', 0) or 0
+                        _sl_min_pct = max(2.0, (_atr_sl / px * 100) if px else 2.0)  # 최소 1.5% 또는 ATR%
+                        _sl_min = px * (1 - _sl_min_pct / 100)
+                        sl = _round_price_sym(sym, min(_sl_bb, _sl_min))
                         qty = _round_qty(sym, usdt * lev / px)
                         if qty <= 0 or qty * px < 20:
                             step, _ = _get_symbol_filters(sym)
@@ -2629,18 +2717,18 @@ def check_bb_box():
                         _tp_dist = abs(tp - px)
                         _rr = _tp_dist / _sl_dist if _sl_dist else 0
 
-                        order = client.futures_create_order(symbol=sym, side='BUY', type='MARKET', quantity=str(qty))
+                        order = client.futures_create_order(symbol=sym, side='BUY', type='MARKET', quantity=str(qty), newClientOrderId=f'bb_{uuid.uuid4().hex[:16]}')
                         _positions_cache['ts'] = 0
                         _sl_ok = False
                         try:
                             client.futures_create_order(symbol=sym, side='SELL', type='STOP_MARKET',
-                                stopPrice=str(sl), quantity=str(qty), reduceOnly=True)
+                                stopPrice=str(sl), quantity=str(qty), reduceOnly=True, newClientOrderId=f'bbsl_{uuid.uuid4().hex[:12]}')
                             _sl_ok = True
                         except: pass
-                        _tp_qty = _round_qty(sym, qty / 2) or qty
+                        _tp_qty = qty  # BB 박스: 전량 TP (횡보장은 추세 없어 트레일링 비효율)
                         try:
                             client.futures_create_order(symbol=sym, side='SELL', type='TAKE_PROFIT_MARKET',
-                                stopPrice=str(tp), quantity=str(_tp_qty), reduceOnly=True)
+                                stopPrice=str(tp), quantity=str(_tp_qty), reduceOnly=True, newClientOrderId=f'bbtp_{uuid.uuid4().hex[:12]}')
                         except: pass
                         if not _sl_ok:
                             try:
@@ -2652,8 +2740,8 @@ def check_bb_box():
                         _entry_time[sym] = time.time()
                         _entry_source[sym] = 'bb_box'
                         try:
-                            _fill = client.futures_get_all_orders(symbol=sym, limit=1)
-                            _avg = float(_fill[-1].get('avgPrice', 0)) if _fill else 0
+                            _fill = client.futures_get_order(symbol=sym, orderId=order['orderId'])
+                            _avg = float(_fill.get('avgPrice', 0))
                             entry_px = _avg if _avg > 0 else px
                         except: entry_px = px
                         trade_db.add_trade({"symbol": sym, "side": "🟢 롱", "action": "진입",
@@ -2668,7 +2756,11 @@ def check_bb_box():
                     # === 위치 10~30%: LIMIT 하단 예약 ===
                     else:
                         limit_px = _round_price_sym(sym, best['bb_lower'] * 1.002)
-                        sl = _round_price_sym(sym, limit_px * (1 - sl_pct / 100))
+                        _sl_bb = best['bb_lower'] * 0.997
+                        _atr_sl = best.get('atr', 0) or 0
+                        _sl_min_pct = max(2.0, (_atr_sl / limit_px * 100) if limit_px else 2.0)
+                        _sl_min = limit_px * (1 - _sl_min_pct / 100)
+                        sl = _round_price_sym(sym, min(_sl_bb, _sl_min))
                         qty = _round_qty(sym, usdt * lev / limit_px)
                         if qty <= 0 or qty * limit_px < 20:
                             step, _ = _get_symbol_filters(sym)
@@ -2688,7 +2780,7 @@ def check_bb_box():
                             del _bb_limit_orders[sym]
 
                         order = client.futures_create_order(symbol=sym, side='BUY', type='LIMIT',
-                            price=str(limit_px), quantity=str(qty), timeInForce='GTC')
+                            price=str(limit_px), quantity=str(qty), timeInForce='GTC', newClientOrderId=f'bbl_{uuid.uuid4().hex[:16]}')
                         _bb_limit_orders[sym] = {'order_id': order['orderId'], 'price': limit_px, 'qty': qty, 'sl': sl, 'tp': tp}
                         _pending_fills[sym] = {
                             'order_id': order['orderId'], 'sl': sl, 'tp': tp,
@@ -2705,6 +2797,592 @@ def check_bb_box():
 
     except Exception as e:
         log(f"  BB 박스 오류: {e}")
+
+
+def check_trend_short():
+    """
+    추세 추종 숏 — 하락장에서 약한 종목 숏
+    조건: BTC RSI < 40 + ADX > 25 (하락 추세 확인)
+        + 종목 RSI < 35 + BB pos < 10% (하방 모멘텀)
+        + 거래량 1h > 평균의 1.2배 (패닉셀 확인)
+    SL: BB mid (반등 시 중간선 위로 가면 추세 끝)
+    TP: ATR × 2.5 아래
+    """
+    global _trend_short_cache
+    now = time.time()
+    if now - _trend_short_cache['ts'] < 300:
+        return
+    _trend_short_cache['ts'] = now
+
+    # 하락장 확인: BTC RSI < 40
+    _btc_rsi = _btc_cache.get('rsi', 50)
+    if _btc_rsi >= 40:
+        return
+
+    ok, reason = _institutional_guard()
+    if not ok:
+        return
+
+    try:
+        client = get_client()
+        held = get_held_symbols()
+        if len(held) >= MAX_ORDERS:
+            return
+
+        symbols = [s for s in get_scan_universe() if s not in {'BTCUSDT'}]
+        signals = []
+
+        for sym in symbols:
+            if sym in held or sym in BLACKLIST:
+                continue
+            if sym in _cooldown and time.time() < _cooldown[sym]:
+                continue
+
+            try:
+                px = float(get_price(sym))
+                ind = calc_indicators(get_klines(sym, '1h', 50))
+                rsi = ind.get('rsi', 50) or 50
+                adx = ind.get('adx', 0) or 0
+                atr = ind.get('atr', 0) or 0
+                bb_upper = ind.get('bb_upper', 0) or 0
+                bb_lower = ind.get('bb_lower', 0) or 0
+                bb_mid = ind.get('bb_mid', 0) or 0
+                # 거래량 직접 계산 (indicators에 없으므로)
+                _kl = get_klines(sym, '1h', 20)
+                _vols = _kl['volume'].tolist() if hasattr(_kl, 'tolist') else [float(k[5]) for k in _kl]
+                volume = _vols[-1] if _vols else 0
+                vol_avg = sum(_vols[:-1]) / max(len(_vols) - 1, 1) if len(_vols) > 1 else volume
+
+                if not (bb_upper > bb_lower > 0) or atr <= 0:
+                    continue
+
+                bb_pos = (px - bb_lower) / (bb_upper - bb_lower) * 100
+
+                # 조건: RSI < 40 + BB pos < 25% (하방 모멘텀)
+                # 거래량 조건은 선택적 가산 (없어도 진입 가능)
+                is_weak = rsi < 40
+                is_at_low = bb_pos < 25
+                _vol_bonus = volume > vol_avg * 1.2 if vol_avg > 0 else False
+
+                is_signal = is_weak and is_at_low
+
+                # 로그
+                if is_weak and is_at_low:
+                    try:
+                        with open(TREND_SHORT_LOG, 'a') as f:
+                            f.write(json.dumps({
+                                "time": datetime.now().strftime('%Y-%m-%d %H:%M'),
+                                "symbol": sym, "price": px, "rsi": round(rsi),
+                                "bb_pos": round(bb_pos, 1), "adx": round(adx),
+                                "vol_ratio": round(volume / vol_avg, 2) if vol_avg else 0,
+                                "signal": is_signal, "btc_rsi": round(_btc_rsi),
+                            }) + '\n')
+                    except: pass
+
+                if is_signal:
+                    signals.append({
+                        'symbol': sym, 'price': px, 'rsi': rsi, 'adx': adx,
+                        'atr': atr, 'bb_pos': bb_pos,
+                        'bb_upper': bb_upper, 'bb_lower': bb_lower, 'bb_mid': bb_mid,
+                    })
+
+            except Exception as _e:
+                continue
+
+        # 시그널 종목 진입 (RSI 낮은 순 = 가장 약한 종목 우선)
+        if signals:
+            ranked = sorted(signals, key=lambda x: x['rsi'])
+            _entered = 0
+
+            for best in ranked:
+                if _entered >= 2:  # 추세 숏 최대 2개
+                    break
+                sym = best['symbol']
+                if _check_already_held(sym):
+                    continue
+                _today = datetime.now().strftime('%Y-%m-%d')
+                if _daily_trades.get('date') == _today and _daily_trades.get('count', 0) >= MAX_DAILY_TRADES:
+                    break
+
+                usdt = TREND_SHORT_USDT
+                lev = ETH_LEV if sym == 'ETHUSDT' else ALT_LEV
+                try:
+                    set_margin_type(sym, "ISOLATED")
+                    set_leverage(sym, lev)
+                    px = float(get_price(sym))
+
+                    atr = best['atr']
+                    atr_pct = atr / px * 100
+
+                    # SL: ATR × 1.5 위 (BB mid가 너무 멀면 ATR 기반으로 대체)
+                    _sl_mid = best['bb_mid']
+                    _sl_atr = px + atr * 1.5
+                    sl = _round_price_sym(sym, min(_sl_mid, _sl_atr))  # 더 가까운 쪽
+                    # TP: ATR × 2.0 아래
+                    tp = _round_price_sym(sym, px - atr * 2.0)
+                    if tp >= px * 0.995 or sl <= px * 1.001:
+                        continue
+
+                    qty = _round_qty(sym, usdt * lev / px)
+                    if qty <= 0 or qty * px < 20:
+                        step, _ = _get_symbol_filters(sym)
+                        qty = _round_qty(sym, 21.0 / px + float(step))
+                    if qty <= 0:
+                        continue
+
+                    _sl_dist = abs(sl - px)
+                    _tp_dist = abs(px - tp)
+                    _rr = _tp_dist / _sl_dist if _sl_dist else 0
+                    if _rr < 0.8:  # 최소 R:R 1:0.8 (추세 방향이므로 승률로 보상)
+                        continue
+
+                    # 시장가 숏 진입
+                    order = client.futures_create_order(symbol=sym, side='SELL', type='MARKET',
+                        quantity=str(qty), newClientOrderId=f'ts_{uuid.uuid4().hex[:16]}')
+                    _positions_cache['ts'] = 0
+                    _sl_ok = False
+                    try:
+                        client.futures_create_order(symbol=sym, side='BUY', type='STOP_MARKET',
+                            stopPrice=str(sl), quantity=str(qty), reduceOnly=True,
+                            newClientOrderId=f'tssl_{uuid.uuid4().hex[:12]}')
+                        _sl_ok = True
+                    except: pass
+                    try:
+                        client.futures_create_order(symbol=sym, side='BUY', type='TAKE_PROFIT_MARKET',
+                            stopPrice=str(tp), quantity=str(qty), reduceOnly=True,
+                            newClientOrderId=f'tstp_{uuid.uuid4().hex[:12]}')
+                    except: pass
+                    if not _sl_ok:
+                        try:
+                            client.futures_create_order(symbol=sym, side='BUY', type='MARKET',
+                                quantity=str(qty), reduceOnly=True)
+                        except: pass
+                        continue
+
+                    _sltp_done.add(sym)
+                    _tp_cache[sym] = tp
+                    _entry_time[sym] = time.time()
+                    _entry_source[sym] = 'trend_short'
+                    trade_db.add_trade({"symbol": sym, "side": "🔴 숏", "action": "진입",
+                        "qty": qty, "price": px, "sl": sl, "tp": tp, "source": "trend_short",
+                        "extra": json.dumps({"rsi": round(best['rsi']), "adx": round(best['adx']),
+                                             "bb_pos": round(best['bb_pos']), "btc_rsi": round(_btc_rsi)})})
+                    log(f"  📉 추세숏: {sym} @ {px} RSI={best['rsi']:.0f} SL={sl}(mid) TP={tp} R:R=1:{_rr:.1f}")
+                    send_message(TG_TOKEN, TG_CHAT,
+                        f"📉 <b>추세 숏</b> (BTC RSI {_btc_rsi:.0f})\n"
+                        f"   {sym} @ ${px}\n"
+                        f"   RSI={best['rsi']:.0f} BB pos={best['bb_pos']:.0f}%\n"
+                        f"   SL ${sl} (BB mid) → TP ${tp}\n"
+                        f"   R:R 1:{_rr:.1f}")
+                    _institutional_post_entry(sym, 'trend_short')
+                    _entered += 1
+
+                except Exception as e:
+                    log(f"  ❌ 추세숏 실패: {e}")
+
+    except Exception as e:
+        log(f"  추세숏 오류: {e}")
+
+
+def check_contrarian_short():
+    """
+    역행 과매수 숏 — 하락장에서 혼자 오른 알트를 숏
+    조건: BTC RSI < 50 (약세) + 종목 RSI > 60 + BB pos > 60% + ADX > 25
+    근거: 하락장에서 역행 상승한 알트는 결국 시장에 끌려 내려옴
+    SL: BB 상단 + 최소 2%
+    TP: BB mid (과매수 해소 = 중간선 복귀)
+    """
+    global _contrarian_short_cache
+    now = time.time()
+    if now - _contrarian_short_cache['ts'] < 300:
+        return
+    _contrarian_short_cache['ts'] = now
+
+    # 하락장 확인: BTC RSI < 50
+    _btc_rsi = _btc_cache.get('rsi', 50)
+    if _btc_rsi >= 50:
+        return
+
+    ok, reason = _institutional_guard()
+    if not ok:
+        return
+
+    try:
+        client = get_client()
+        held = get_held_symbols()
+        if len(held) >= MAX_ORDERS:
+            return
+
+        symbols = [s for s in get_scan_universe() if s not in {'BTCUSDT'}]
+        signals = []
+
+        for sym in symbols:
+            if sym in held or sym in BLACKLIST:
+                continue
+            if sym in _cooldown and time.time() < _cooldown[sym]:
+                continue
+
+            try:
+                px = float(get_price(sym))
+                ind = calc_indicators(get_klines(sym, '1h', 50))
+                rsi = ind.get('rsi', 50) or 50
+                adx = ind.get('adx', 0) or 0
+                atr = ind.get('atr', 0) or 0
+                bb_upper = ind.get('bb_upper', 0) or 0
+                bb_lower = ind.get('bb_lower', 0) or 0
+                bb_mid = ind.get('bb_mid', 0) or 0
+
+                if not (bb_upper > bb_lower > 0) or atr <= 0:
+                    continue
+
+                bb_pos = (px - bb_lower) / (bb_upper - bb_lower) * 100
+
+                # 조건: RSI > 60 + BB pos > 60% + ADX > 25 (과매수 + 추세 존재)
+                is_overbought = rsi > 60
+                is_high = bb_pos > 60
+                is_trending = adx > 25
+
+                is_signal = is_overbought and is_high and is_trending
+
+                if is_overbought and is_high:
+                    try:
+                        with open(CONTRARIAN_SHORT_LOG, 'a') as f:
+                            f.write(json.dumps({
+                                "time": datetime.now().strftime('%Y-%m-%d %H:%M'),
+                                "symbol": sym, "price": px, "rsi": round(rsi),
+                                "bb_pos": round(bb_pos, 1), "adx": round(adx),
+                                "signal": is_signal, "btc_rsi": round(_btc_rsi),
+                            }) + '\n')
+                    except: pass
+
+                if is_signal:
+                    signals.append({
+                        'symbol': sym, 'price': px, 'rsi': rsi, 'adx': adx,
+                        'atr': atr, 'bb_pos': bb_pos,
+                        'bb_upper': bb_upper, 'bb_lower': bb_lower, 'bb_mid': bb_mid,
+                    })
+
+            except Exception:
+                continue
+
+        if signals:
+            # RSI 높은 순 (가장 과매수인 종목 우선)
+            ranked = sorted(signals, key=lambda x: -x['rsi'])
+
+            for best in ranked[:1]:  # 최대 1건만 (보수적)
+                sym = best['symbol']
+                if _check_already_held(sym):
+                    continue
+                _today = datetime.now().strftime('%Y-%m-%d')
+                if _daily_trades.get('date') == _today and _daily_trades.get('count', 0) >= MAX_DAILY_TRADES:
+                    break
+
+                usdt = CONTRARIAN_SHORT_USDT
+                lev = ETH_LEV if sym == 'ETHUSDT' else ALT_LEV
+                try:
+                    set_margin_type(sym, "ISOLATED")
+                    set_leverage(sym, lev)
+                    px = float(get_price(sym))
+
+                    atr = best['atr']
+                    # LIMIT 진입가: BB 상단 -0.2% (꼭대기 근처에서만 체결)
+                    limit_px = _round_price_sym(sym, best['bb_upper'] * 0.998)
+                    if limit_px <= px:  # 이미 상단 위면 현재가로
+                        limit_px = _round_price_sym(sym, px * 1.002)
+
+                    # SL: LIMIT 진입가 + 최소 2%
+                    _sl_bb = best['bb_upper'] * 1.003
+                    _sl_min = limit_px * 1.02
+                    sl = _round_price_sym(sym, max(_sl_bb, _sl_min))
+                    # TP: BB mid (과매수 해소)
+                    tp = _round_price_sym(sym, best['bb_mid'])
+                    if tp >= limit_px * 0.995 or sl <= limit_px * 1.005:
+                        continue
+
+                    qty = _round_qty(sym, usdt * lev / limit_px)
+                    if qty <= 0 or qty * limit_px < 20:
+                        step, _ = _get_symbol_filters(sym)
+                        qty = _round_qty(sym, 21.0 / limit_px + float(step))
+                    if qty <= 0:
+                        continue
+
+                    _sl_dist = abs(sl - limit_px)
+                    _tp_dist = abs(limit_px - tp)
+                    _rr = _tp_dist / _sl_dist if _sl_dist else 0
+                    if _rr < 0.8:
+                        continue
+
+                    # LIMIT 예약 (BB 상단까지 올라와야 체결 — 관망 후 진입)
+                    order = client.futures_create_order(symbol=sym, side='SELL', type='LIMIT',
+                        price=str(limit_px), quantity=str(qty), timeInForce='GTC',
+                        newClientOrderId=f'cs_{uuid.uuid4().hex[:16]}')
+                    _pending_fills[sym] = {
+                        'order_id': order['orderId'], 'sl': sl, 'tp': tp,
+                        'side': 'SELL', 'entry': limit_px, 'score': 0, 'atr': atr,
+                        'time': time.time(), 'source': 'contrarian_short', 'expire': time.time() + 1800,  # 30분 대기
+                    }
+                    log(f"  📦 역행숏 예약: {sym} @ {limit_px} (BB상단 대기) RSI={best['rsi']:.0f} R:R=1:{_rr:.1f}")
+                    send_message(TG_TOKEN, TG_CHAT,
+                        f"📦 <b>역행 숏 예약</b> (BB상단 대기)\n"
+                        f"   {sym} @ ${limit_px}\n"
+                        f"   RSI={best['rsi']:.0f} BB={best['bb_pos']:.0f}% ADX={best['adx']:.0f}\n"
+                        f"   BTC RSI {_btc_rsi:.0f}\n"
+                        f"   SL ${sl} → TP ${tp} | R:R 1:{_rr:.1f}")
+
+                except Exception as e:
+                    log(f"  ❌ 역행숏 실패: {e}")
+
+    except Exception as e:
+        log(f"  역행숏 오류: {e}")
+
+
+def check_bb_short():
+    """
+    BB 박스 숏 — 횡보장에서 상단 매도 → 하단 청산
+    조건: BB 폭 1~5.5% (박스권) + 가격이 상단 근처 + RSI 50~70 + MTF 2/3 상단 합의
+    BTC RSI > 65이면 스킵 (강한 상승장에서 숏 금지)
+    """
+    global _bb_short_cache
+    now = time.time()
+    if now - _bb_short_cache['ts'] < 300:  # 5분
+        return
+    _bb_short_cache['ts'] = now
+
+    ok, reason = _institutional_guard()
+    if not ok:
+        return
+
+    # BTC 강한 상승장 필터
+    if _btc_cache.get('rsi', 50) > 65:
+        return
+
+    try:
+        client = get_client()
+        held = get_held_symbols()
+        if len(held) >= MAX_ORDERS:
+            return
+
+        _bb_exclude = {'BTCUSDT'}
+        symbols = [s for s in get_scan_universe() if s not in _bb_exclude]
+        signals = []
+
+        for sym in symbols:
+            if sym in held or sym in BLACKLIST:
+                continue
+            if sym in _cooldown and time.time() < _cooldown[sym]:
+                continue
+
+            try:
+                px = float(get_price(sym))
+                _bb_top_count = 0
+                _bb_1h = None
+
+                for _tf in ['15m', '30m', '1h']:
+                    _ind = calc_indicators(get_klines(sym, _tf, 50))
+                    _bu = _ind.get('bb_upper', 0) or 0
+                    _bl = _ind.get('bb_lower', 0) or 0
+                    _bm = _ind.get('bb_mid', 0) or 0
+                    if not (_bu > _bl > 0):
+                        continue
+                    _pos = (px - _bl) / (_bu - _bl) * 100
+                    if 80 < _pos < 105:
+                        _bb_top_count += 1
+                    if _tf == '1h':
+                        _bb_1h = {
+                            'upper': _bu, 'lower': _bl, 'mid': _bm,
+                            'pos': _pos, 'width': (_bu - _bl) / _bm * 100,
+                            'rsi': _ind.get('rsi', 50) or 50,
+                            'atr': _ind.get('atr', 0) or 0,
+                        }
+
+                if not _bb_1h:
+                    continue
+                rsi = _bb_1h['rsi']
+                atr = _bb_1h['atr']
+                bb_upper = _bb_1h['upper']
+                bb_lower = _bb_1h['lower']
+                bb_mid = _bb_1h['mid']
+                bb_width = _bb_1h['width']
+                bb_pos = _bb_1h['pos']
+                if rsi != rsi: continue  # nan
+
+                is_box = 1.5 < bb_width < 5.5  # 백테스트 1위와 동일
+                is_mtf_top = _bb_top_count >= 3  # 3/3 전 TF 합의 (보수적)
+                is_overbought_rsi = 50 < rsi < 70
+
+                is_signal = is_box and is_mtf_top and is_overbought_rsi
+
+                # 로그
+                if is_box and (_bb_top_count >= 1 or rsi > 60):
+                    try:
+                        with open(BB_SHORT_LOG, 'a') as f:
+                            f.write(json.dumps({
+                                "time": datetime.now().strftime('%Y-%m-%d %H:%M'),
+                                "symbol": sym, "price": px,
+                                "bb_width": round(bb_width, 2),
+                                "bb_pos": round(bb_pos, 1),
+                                "rsi": round(rsi),
+                                "mtf_top": _bb_top_count,
+                                "signal": is_signal,
+                            }) + '\n')
+                    except Exception:
+                        pass
+
+                if is_signal:
+                    signals.append({
+                        'symbol': sym, 'price': px, 'rsi': rsi,
+                        'bb_width': bb_width, 'bb_pos': bb_pos,
+                        'bb_upper': bb_upper, 'bb_lower': bb_lower,
+                        'bb_mid': bb_mid, 'atr': atr,
+                        'mtf_top': _bb_top_count,
+                    })
+
+            except Exception as _e:
+                log(f"  ⚠️ BB숏 {sym} 스캔 오류: {str(_e)[:60]}")
+                continue
+
+        # 기존 LIMIT 예약 중 조건 벗어난 것 취소
+        _sig_syms = {s['symbol'] for s in signals}
+        for _sym in list(_bb_short_limit_orders.keys()):
+            if _sym in held or _sym not in _sig_syms:
+                try:
+                    client.futures_cancel_order(symbol=_sym, orderId=_bb_short_limit_orders[_sym]['order_id'])
+                    log(f"  📦 BB숏 {_sym} 예약 취소 (조건 벗어남)")
+                except: pass
+                _pending_fills.pop(_sym, None)
+                del _bb_short_limit_orders[_sym]
+
+        # 시그널 종목 진입 (bb_pos 높은 순)
+        if signals:
+            ranked = sorted(signals, key=lambda x: -x['bb_pos'])  # 상단에 가까울수록 우선
+            _max_orders = min(2, MAX_ORDERS - len(held))  # 숏은 최대 2개
+            _placed = len([s for s in _bb_short_limit_orders if s not in held])
+            _entered = 0
+
+            for best in ranked:
+                if _entered + _placed >= _max_orders:
+                    break
+                sym = best['symbol']
+                if _check_already_held(sym):
+                    continue
+                _today = datetime.now().strftime('%Y-%m-%d')
+                if _daily_trades.get('date') == _today and _daily_trades.get('count', 0) >= MAX_DAILY_TRADES:
+                    break
+
+                usdt = max(BB_SHORT_USDT * (0.7 if _bear_mode else 1.0), 12)
+                lev = ETH_LEV if sym == 'ETHUSDT' else ALT_LEV
+                try:
+                    set_margin_type(sym, "ISOLATED")
+                    set_leverage(sym, lev)
+                    px = float(get_price(sym))
+
+                    atr = best.get('atr', 0) or 0
+                    # SL: BB 상단 +0.3%, 진입가 대비 최소 1.5% 또는 ATR%
+                    _sl_bb = best['bb_upper'] * 1.003
+                    _atr_sl = best.get('atr', 0) or 0
+                    _sl_min_pct = max(2.0, (_atr_sl / px * 100) if px else 2.0)
+                    _sl_min = px * (1 + _sl_min_pct / 100)
+                    sl = _round_price_sym(sym, max(_sl_bb, _sl_min))
+                    # TP: BB 하단
+                    tp = _round_price_sym(sym, best['bb_lower'])
+                    if best['bb_lower'] >= px * 0.99:
+                        continue  # mid가 현재가 가까우면 스킵
+                    _mtf = best.get('mtf_top', 0)
+
+                    # === 위치 > 90%: 시장가 즉시 ===
+                    if best['bb_pos'] > 90:
+                        if sym in _bb_short_limit_orders:
+                            try: client.futures_cancel_order(symbol=sym, orderId=_bb_short_limit_orders[sym]['order_id'])
+                            except: pass
+                            _pending_fills.pop(sym, None)
+                            del _bb_short_limit_orders[sym]
+                        qty = _round_qty(sym, usdt * lev / px)
+                        if qty <= 0 or qty * px < 20:
+                            step, _ = _get_symbol_filters(sym)
+                            qty = _round_qty(sym, 21.0 / px + float(step))
+                        if qty <= 0: continue
+                        _sl_dist = abs(sl - px)
+                        _tp_dist = abs(px - tp)
+                        _rr = _tp_dist / _sl_dist if _sl_dist else 0
+
+                        order = client.futures_create_order(symbol=sym, side='SELL', type='MARKET', quantity=str(qty), newClientOrderId=f'bbs_{uuid.uuid4().hex[:16]}')
+                        _positions_cache['ts'] = 0
+                        _sl_ok = False
+                        try:
+                            client.futures_create_order(symbol=sym, side='BUY', type='STOP_MARKET',
+                                stopPrice=str(sl), quantity=str(qty), reduceOnly=True, newClientOrderId=f'bbssl_{uuid.uuid4().hex[:12]}')
+                            _sl_ok = True
+                        except: pass
+                        try:
+                            client.futures_create_order(symbol=sym, side='BUY', type='TAKE_PROFIT_MARKET',
+                                stopPrice=str(tp), quantity=str(qty), reduceOnly=True, newClientOrderId=f'bbstp_{uuid.uuid4().hex[:12]}')
+                        except: pass
+                        if not _sl_ok:
+                            try:
+                                client.futures_create_order(symbol=sym, side='BUY', type='MARKET', quantity=str(qty), reduceOnly=True)
+                            except: pass
+                            continue
+                        _sltp_done.add(sym)
+                        _tp_cache[sym] = tp
+                        _entry_time[sym] = time.time()
+                        _entry_source[sym] = 'bb_short'
+                        try:
+                            _fill = client.futures_get_order(symbol=sym, orderId=order['orderId'])
+                            _avg = float(_fill.get('avgPrice', 0))
+                            entry_px = _avg if _avg > 0 else px
+                        except: entry_px = px
+                        trade_db.add_trade({"symbol": sym, "side": "🔴 숏", "action": "진입",
+                            "qty": qty, "price": entry_px, "sl": sl, "tp": tp, "source": "bb_short",
+                            "extra": json.dumps({"bb_width": round(best['bb_width'], 1), "bb_pos": round(best['bb_pos'], 0), "mode": "market"})})
+                        log(f"  🔻 BB숏 시장가: {sym} @ {entry_px} (위치{best['bb_pos']:.0f}%>90%) R:R=1:{_rr:.1f} MTF={_mtf}/3")
+                        send_message(TG_TOKEN, TG_CHAT,
+                            f"🔻 <b>BB 숏 진입</b>\n   {sym} @ ${entry_px} (상단 {best['bb_pos']:.0f}%)\n   MTF {_mtf}/3 | R:R 1:{_rr:.1f}")
+                        _institutional_post_entry(sym, 'bb_short')
+                        _entered += 1
+
+                    # === 위치 80~90%: LIMIT 상단 예약 ===
+                    else:
+                        limit_px = _round_price_sym(sym, best['bb_upper'] * 0.998)
+                        _sl_bb = best['bb_upper'] * 1.003
+                        _atr_sl = best.get('atr', 0) or 0
+                        _sl_min_pct = max(2.0, (_atr_sl / limit_px * 100) if limit_px else 2.0)
+                        _sl_min = limit_px * (1 + _sl_min_pct / 100)
+                        sl = _round_price_sym(sym, max(_sl_bb, _sl_min))
+                        qty = _round_qty(sym, usdt * lev / limit_px)
+                        if qty <= 0 or qty * limit_px < 20:
+                            step, _ = _get_symbol_filters(sym)
+                            qty = _round_qty(sym, 21.0 / limit_px + float(step))
+                        if qty <= 0: continue
+                        _sl_dist = abs(sl - limit_px)
+                        _tp_dist = abs(limit_px - tp)
+                        _rr = _tp_dist / _sl_dist if _sl_dist else 0
+
+                        if sym in _bb_short_limit_orders:
+                            _old = _bb_short_limit_orders[sym]
+                            if abs(_old['price'] - limit_px) / limit_px < 0.01:
+                                continue
+                            try: client.futures_cancel_order(symbol=sym, orderId=_old['order_id'])
+                            except: pass
+                            _pending_fills.pop(sym, None)
+                            del _bb_short_limit_orders[sym]
+
+                        order = client.futures_create_order(symbol=sym, side='SELL', type='LIMIT',
+                            price=str(limit_px), quantity=str(qty), timeInForce='GTC', newClientOrderId=f'bbsl_{uuid.uuid4().hex[:16]}')
+                        _bb_short_limit_orders[sym] = {'order_id': order['orderId'], 'price': limit_px, 'qty': qty, 'sl': sl, 'tp': tp}
+                        _pending_fills[sym] = {
+                            'order_id': order['orderId'], 'sl': sl, 'tp': tp,
+                            'side': 'SELL', 'entry': limit_px, 'score': 0, 'atr': atr,
+                            'time': time.time(), 'source': 'bb_short', 'expire': time.time() + 600,
+                        }
+                        log(f"  📦 BB숏 예약: {sym} @ {limit_px} (위치{best['bb_pos']:.0f}%) R:R=1:{_rr:.1f} MTF={_mtf}/3")
+                        send_message(TG_TOKEN, TG_CHAT,
+                            f"📦 <b>BB 숏 예약</b>\n   {sym} @ ${limit_px} (BB상단 대기)\n   MTF {_mtf}/3 | R:R 1:{_rr:.1f}")
+                        _placed += 1
+                except Exception as e:
+                    log(f"  ❌ BB숏 진입 실패: {e}")
+
+    except Exception as e:
+        log(f"  BB숏 오류: {e}")
 
 
 def check_cvd_divergence():
@@ -2728,18 +3406,18 @@ def check_cvd_divergence():
         if len(held) >= MAX_ORDERS:
             return
 
-        # #5: BTC 하락 중이면 알트 CVD 무시 (BTC 1h RSI < 30 = 강한 하락)
+        # BTC 하락 중이면 CVD 롱 스킵 (손실 11건 대부분 BTC 하락장)
         _btc_rsi_1h = _btc_cache.get('rsi', 50)
-        if _btc_rsi_1h < 30:
+        if _btc_rsi_1h < 45:
             return
 
-        # 스캔 대상: ETH + 상위 알트 (SOL 제외 — 4건 25% -$0.39)
-        _cvd_exclude = {'SOLUSDT'}
+        # 대형 코인 CVD 제외 (반등폭 부족 → 소액 수익만): SOL 4건-$0.32, ETH 2건-$0.80, BNB 2건-$0.29
+        _cvd_exclude = {'SOLUSDT', 'ETHUSDT', 'BNBUSDT'}
         symbols = [s for s in get_scan_universe() if s not in _cvd_exclude]
         signals = []
 
         for sym in symbols:
-            if sym in held or sym in BLACKLIST:
+            if sym in held or sym in BLACKLIST or sym in WEAK_SYMBOLS:
                 continue
             if sym in _cooldown and time.time() < _cooldown[sym]:
                 continue
@@ -2772,9 +3450,11 @@ def check_cvd_divergence():
                 cvd_12h_low = min(recent_cvd)
                 price_12h_low = min(recent_closes)
 
-                # 조건: 현재가가 12h 저점 근처 (-2% ~ +1%) + CVD 저점 대비 상승
+                # 조건: 현재가가 12h 저점 근처 (-2% ~ +1%) + 저점이 최근 4시간 내 (신선도)
                 _low_dist = (px - price_12h_low) / price_12h_low if price_12h_low > 0 else 999
-                near_low = -0.02 < _low_dist < 0.01  # 저점 아래 2%까지만 허용
+                _low_idx = recent_closes.index(price_12h_low) if price_12h_low in recent_closes else 0
+                _low_fresh = _low_idx >= len(recent_closes) - 8  # 최근 8캔들(=8h) 이내
+                near_low = -0.02 < _low_dist < 0.01 and _low_fresh
 
                 # CVD 상승 판정: 저점 대비 5% 회복
                 if cvd_12h_low < 0:
@@ -2790,7 +3470,7 @@ def check_cvd_divergence():
                 atr = ind.get('atr', 0) or 0  # ATR도 여기서 가져옴 (진입 시 재사용)
 
                 # cvd_trend_up 제거 — 충족률 7%로 거래 차단. cvd_rising이 이미 매수세 확인
-                is_signal = near_low and cvd_rising and rsi < 35
+                is_signal = near_low and cvd_rising and rsi < 35  # 45→35 복원 (보수적: 확실한 과매도만)
 
                 # 로그 (조건 부분 충족이라도 기록)
                 if near_low or (rsi < 35 and cvd_rising):
@@ -2845,14 +3525,17 @@ def check_cvd_divergence():
                     break
                 log(f"  📊 CVD 다이버전스 감지: {sym} RSI={best['rsi']:.0f} CVD↑{best['cvd_delta']}%")
 
-                # CVD 전용 진입금 — $25 기본, 하락장 70%
-                usdt = max(ALT_USDT * (0.7 if _bear_mode else 1.0), 12)
+                # CVD 진입금 $35 (소수 정예 — 대형코인 제외 후 건당 크기 인상)
+                usdt = max(35 * (0.7 if _bear_mode else 1.0), 15)
                 lev = ETH_LEV if sym == 'ETHUSDT' else ALT_LEV
                 try:
                     set_margin_type(sym, "ISOLATED")
                     set_leverage(sym, lev)
                     px = float(get_price(sym))
-                    limit_px = _round_price_sym(sym, px * 0.995)  # 0.5% 아래 지정가
+                    # ATR 기반 진입 오프셋 (체결률 개선: 변동성 큰 종목은 더 아래, 작은 종목은 가까이)
+                    _atr_tmp = best.get('atr', 0) or 0
+                    _offset = min(max(_atr_tmp * 0.3 / px if px else 0.005, 0.002), 0.008)  # 0.2~0.8%
+                    limit_px = _round_price_sym(sym, px * (1 - _offset))
 
                     qty = _round_qty(sym, usdt * lev / px)
                     # 노셔널 $20 최소 보장 (LIMIT 가격 기준)
@@ -2869,8 +3552,9 @@ def check_cvd_divergence():
                         atr = _ind.get('atr', 0) or 0
                     atr_pct = atr / px * 100 if px else 1
 
-                    sl_pct = max(atr_pct * 1.5, 2.0 / lev)
-                    tp_pct = max(atr_pct * 5.0, sl_pct * 3.3)
+                    _sl_mult = 2.0 if _btc_cache.get('rsi', 50) < 45 else 1.5  # 하락장 SL 넓게
+                    sl_pct = max(atr_pct * _sl_mult, 2.0 / lev)
+                    tp_pct = max(atr_pct * 3.0, sl_pct * 2.0)  # TP 도달률 개선
                     sl = _round_price_sym(sym, limit_px * (1 - sl_pct / 100))  # SL/TP도 LIMIT 가격 기준
                     tp = _round_price_sym(sym, limit_px * (1 + tp_pct / 100))
 
@@ -2883,12 +3567,9 @@ def check_cvd_divergence():
                         'order_id': order['orderId'], 'sl': sl, 'tp': tp,
                         'side': 'BUY', 'entry': limit_px, 'score': 0, 'atr': atr,
                         'time': time.time(), 'source': 'cvd_divergence',
-                        'expire': time.time() + 300,
+                        'expire': time.time() + 600,  # 5→10분 (체결률 개선)
                     }
-                    trade_db.add_trade({"symbol": sym, "side": "🟢 롱", "action": "진입",
-                                        "qty": qty, "price": limit_px, "sl": sl, "tp": tp,
-                                        "source": "cvd_divergence",
-                                        "extra": json.dumps({"rsi": round(best['rsi']), "cvd_delta": best['cvd_delta']})})
+                    # DB 기록은 check_fills() 체결 시에만 (LIMIT 미체결 유령 방지)
                     _rr = tp_pct / sl_pct if sl_pct else 0
                     log(f"  ✅ CVD 롱 진입: {sym} ${usdt:.0f} @ {limit_px} SL={sl} TP={tp} R:R=1:{_rr:.1f}")
                     send_message(TG_TOKEN, TG_CHAT,
@@ -3469,12 +4150,14 @@ def check_volume_profile():
 
 
 def _round_qty(symbol, qty):
-    """수량을 심볼 규격에 맞게 반올림"""
+    """수량을 심볼 규격에 맞게 반올림 (부동소수점 오차 방지)"""
     try:
         from math import floor
         step, _ = _get_symbol_filters(symbol)
         step = float(step)
-        return floor(qty / step) * step
+        # step의 소수점 자릿수 계산
+        _dec = len(str(step).rstrip('0').split('.')[-1]) if '.' in str(step) else 0
+        return round(floor(qty / step) * step, _dec)
     except Exception:
         return round(qty, 3)
 
@@ -3780,9 +4463,12 @@ def update_cycle():
     # scan_listing_announcements()
     # check_listing_short()
 
-    # 활성 전략: CVD + BB 박스
-    check_cvd_divergence()       # #L: CVD 다이버전스 (하락장 바닥)
-    check_bb_box()               # BB 박스 왕복 (횡보장 하단 매수)
+    # 활성 전략: CVD + BB 롱/숏 + 추세숏 + 역행숏
+    check_cvd_divergence()       # CVD 다이버전스 (BTC RSI>45일 때만)
+    check_bb_box()               # BB 롱 (BTC RSI>50일 때만)
+    check_bb_short()             # BB 숏 (횡보장 상단)
+    check_trend_short()          # 추세 숏 (하락장 모멘텀)
+    check_contrarian_short()     # 역행 숏 (하락장에서 과매수 알트)
 
     # 나머지 기관 전략 OFF (데이터 축적 후 재검토)
     # check_short_squeeze()        # #M
@@ -3892,27 +4578,34 @@ def verify_sltp():
             if sym in _pending_fills:
                 continue
 
-            # 미추적 포지션 → ATR 기반 SL/TP 배치
+            # 미추적 포지션 → ATR 기반 SL/TP 배치 (롱/숏 자동 판별)
             client = get_client()
             _ind = calc_indicators(get_klines(sym, '1h', 50))
             atr = _ind.get('atr', 0) or 0
             lev = 3 if sym in ('ETHUSDT', 'BTCUSDT') else 2
             atr_pct = atr / entry * 100 if entry else 1
             sl_pct = max(atr_pct * 1.5, 2.0 / lev)
-            tp_pct = max(atr_pct * 5.0, sl_pct * 3.3)
-            sl = _round_price_sym(sym, entry * (1 - sl_pct / 100))
-            tp = _round_price_sym(sym, entry * (1 + tp_pct / 100))
+            tp_pct = max(atr_pct * 3.0, sl_pct * 2.0)  # CVD TP 도달률 개선
+            _is_long = 'LONG' in pos.get('side', 'LONG').upper()
+            if _is_long:
+                sl = _round_price_sym(sym, entry * (1 - sl_pct / 100))
+                tp = _round_price_sym(sym, entry * (1 + tp_pct / 100))
+                _close_side = 'SELL'
+            else:
+                sl = _round_price_sym(sym, entry * (1 + sl_pct / 100))
+                tp = _round_price_sym(sym, entry * (1 - tp_pct / 100))
+                _close_side = 'BUY'
 
             try:
                 client.futures_create_order(
-                    symbol=sym, side='SELL', type='STOP_MARKET',
+                    symbol=sym, side=_close_side, type='STOP_MARKET',
                     stopPrice=str(sl), quantity=str(qty), reduceOnly=True)
             except Exception as e:
                 if '4130' not in str(e):
                     log(f"  verify {sym} SL: {str(e)[:40]}")
             try:
                 client.futures_create_order(
-                    symbol=sym, side='SELL', type='TAKE_PROFIT_MARKET',
+                    symbol=sym, side=_close_side, type='TAKE_PROFIT_MARKET',
                     stopPrice=str(tp), quantity=str(qty), reduceOnly=True)
             except Exception as e:
                 if '4130' not in str(e):
@@ -4025,6 +4718,38 @@ def main():
     log(f"  시그널 큐 활성 | 펀딩비 감지 30분 주기 | 스캔 {SCAN_ALT_COUNT}종목 | 일일 {MAX_DAILY_TRADES}건")
     log("=" * 60)
 
+    # 재시작 시 _entry_source / _entry_time DB에서 복원
+    try:
+        _open = trade_db.get_open_trades()
+        for _ot in _open:
+            _sym = _ot.get('symbol', '')
+            _src = _ot.get('source', 'updater')
+            if _sym and _sym not in _entry_source:
+                _entry_source[_sym] = _src
+            if _sym and _sym not in _entry_time:
+                try:
+                    _t = datetime.strptime(_ot.get('time', ''), '%Y-%m-%d %H:%M:%S')
+                    _entry_time[_sym] = _t.timestamp()
+                except: _entry_time[_sym] = time.time() - 3600  # 폴백 1시간 전
+        if _entry_source:
+            log(f"  🔄 DB에서 포지션 source 복원: {_entry_source}")
+        # 최근 청산 종목 쿨다운 복원 (재시작 시 반복 진입 방지)
+        _recent = trade_db.get_closed_trades(limit=20)
+        for _rt in _recent:
+            _sym = _rt.get('symbol', '')
+            _ct = _rt.get('close_time', '')
+            if _sym and _ct:
+                try:
+                    _closed_at = datetime.strptime(_ct, '%Y-%m-%d %H:%M:%S').timestamp()
+                    _elapsed = time.time() - _closed_at
+                    if _elapsed < COOLDOWN_SEC:  # 아직 쿨다운 중
+                        _cooldown[_sym] = _closed_at + COOLDOWN_SEC
+                except: pass
+        if _cooldown:
+            log(f"  🔄 쿨다운 복원: {list(_cooldown.keys())}")
+    except Exception as _e:
+        log(f"  ⚠️ source 복원 실패: {_e}")
+
     while True:
         try:
             _positions_cache['ts'] = 0  # 사이클 시작 시 캐시 리셋
@@ -4033,10 +4758,37 @@ def main():
             check_partial_tp()
             check_stale_position()  # #F 2h+ 미수익 SL 조임
             check_long_hold()  # #148 장기보유 추세 재검증
-            # 청산된 종목 → 쿨다운 등록 + 연속 손실 추적
+            # 청산된 종목 → DB 업데이트 + 쿨다운 등록 + 연속 손실 추적
             _held = get_held_symbols()
             for sym in (_sltp_done - _held):
                 _cooldown[sym] = time.time() + COOLDOWN_SEC
+                # DB 미청산 거래 자동 정리 (SL/TP 히트 감지)
+                try:
+                    _trades_api = get_client().futures_account_trades(symbol=sym, limit=10)
+                    # 롱 청산=SELL(buyer=False), 숏 청산=BUY(buyer=True) — 양쪽 캡처
+                    _src = _entry_source.get(sym, 'updater')
+                    _is_short = _src in ('bb_short', 'trend_short', 'contrarian_short')
+                    _close_trades = [t for t in _trades_api if t.get('buyer') == _is_short]  # 숏이면 buyer=True
+                    if _close_trades:
+                        _close_px = float(_close_trades[-1]['price'])
+                        _realized = sum(float(t.get('realizedPnl', 0)) for t in _close_trades[-5:])
+                        _open_rows = trade_db.get_open_trades(sym)
+                        if _open_rows:
+                            for _orow in _open_rows:
+                                _entry_px = _orow.get('price', 0) or 0
+                                _qty = _orow.get('qty', 0) or 0
+                                # 폴백 PnL: 롱=(close-entry)*qty, 숏=(entry-close)*qty
+                                if _realized:
+                                    _calc_pnl = round(_realized / len(_open_rows), 4)
+                                elif _is_short:
+                                    _calc_pnl = round((_entry_px - _close_px) * _qty, 4)
+                                else:
+                                    _calc_pnl = round((_close_px - _entry_px) * _qty, 4)
+                                trade_db.update_trade_field(_orow['id'], pnl=_calc_pnl, close_price=_close_px,
+                                    close_time=datetime.now().strftime('%Y-%m-%d %H:%M:%S'), action='청산')
+                                log(f"  📝 {sym} DB 청산 기록: PnL=${_calc_pnl:+.4f} close=${_close_px}")
+                except Exception as _e:
+                    log(f"  ⚠️ {sym} DB 청산 기록 실패: {_e}")
                 # DB에서 마지막 거래 PnL 확인 → 연속 손실 추적
                 try:
                     _db = sqlite3.connect('/home/hyeok/01.APCC/00.ai-lab/trades.db')
@@ -4092,6 +4844,9 @@ def main():
 
             _partial_done.difference_update(_partial_done - _held)
             _sltp_done.difference_update(_sltp_done - _held)
+            # stale _tightened 정리 (재진입 시 stale 체크가 영구 스킵되는 버그 방지)
+            if hasattr(check_stale_position, '_tightened'):
+                check_stale_position._tightened.difference_update(check_stale_position._tightened - _held)
             for sym in list(_tp_cache):
                 if sym not in _held:
                     del _tp_cache[sym]
@@ -4104,6 +4859,15 @@ def main():
             for sym in list(_entry_time):
                 if sym not in _held:
                     del _entry_time[sym]
+            for sym in list(_entry_source):
+                if sym not in _held:
+                    del _entry_source[sym]
+            for sym in list(_bb_limit_orders):
+                if sym not in _held and not has_position(sym):
+                    _bb_limit_orders.pop(sym, None)
+            for sym in list(_bb_short_limit_orders):
+                if sym not in _held and not has_position(sym):
+                    _bb_short_limit_orders.pop(sym, None)
             for sym in list(_sl_synced):
                 if sym not in _held:
                     del _sl_synced[sym]
