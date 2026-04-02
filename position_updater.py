@@ -967,6 +967,17 @@ def check_fills():
             entry = float(pos.get('entry_price', 0))
             qty = float(pos.get('size', 0))
             side_str = pos.get('side', 'LONG')
+            # BLACKLIST 종목 포지션 발견 시 즉시 청산 (재시작 시 잔존 포지션 정리)
+            if sym in BLACKLIST or sym in ('STOUSDT', 'ONTUSDT'):
+                if entry > 0 and qty > 0:
+                    _close = 'SELL' if 'LONG' in side_str.upper() else 'BUY'
+                    try:
+                        client.futures_create_order(symbol=sym, side=_close, type='MARKET',
+                            quantity=str(qty), reduceOnly=True)
+                        log(f"  🚫 {sym} 블랙리스트 포지션 즉시 청산 {qty}")
+                    except: pass
+                _sltp_done.add(sym)
+                continue
             if entry > 0 and qty > 0:
                 # 1회만 시도 후 _sltp_done 등록 (algo 주문은 API에서 조회 불가 → 중복 방지)
                 is_long = 'LONG' in side_str.upper()
