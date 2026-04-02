@@ -184,8 +184,8 @@ def get_scan_universe():
         return _scan_cache['symbols']
     try:
         alts = get_alt_futures_symbols(SCAN_ALT_COUNT)
-        alt_syms = [s for s in alts if s not in SCAN_FIXED][:SCAN_ALT_COUNT]
-        result = SCAN_FIXED + alt_syms
+        alt_syms = [s for s in alts if s not in SCAN_FIXED and s not in BLACKLIST][:SCAN_ALT_COUNT]
+        result = [s for s in SCAN_FIXED if s not in BLACKLIST] + alt_syms
         _scan_cache.update({'ts': now, 'symbols': result})
         return result
     except Exception:
