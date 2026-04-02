@@ -2536,7 +2536,7 @@ def _institutional_post_entry(sym, source):
         _daily_trades['count'] = 0
     _daily_trades['count'] += 1
     # BB 박스 롱/숏: 15분 쿨다운 (횡보장 왕복 재진입 허용), 나머지: 30분
-    _cd = 900 if source in ('bb_box', 'bb_short', 'trend_short', 'contrarian_short') else COOLDOWN_SEC
+    _cd = COOLDOWN_SEC  # 모든 전략 30분 쿨다운 통일 (15분→30분, 반복진입 방지)
     _cooldown[sym] = time.time() + _cd
 
 def check_bb_box():
