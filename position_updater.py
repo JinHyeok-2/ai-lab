@@ -37,7 +37,7 @@ MAX_SL_PCT = 5.0        # SL 최대 거리 (%)
 MAX_LOSS_PER_TRADE = 1.0  # #141 건당 최대 손실 캡 $1.0 (수량 조절 방식)
 MAX_SAME_DIR = 4        # 동일 방향 최대 (2→4, 롱전용이므로 MAX_ORDERS와 동일)
 MAX_DAILY_TRADES = 4    # 3→4 (BB 기회 확보, 1%/일 목표)
-NIGHT_HOURS = set()  # 야간 차단 해제 — 데이터 축적 후 재판단 (암호화폐 24시간 글로벌 시장)
+NIGHT_HOURS = {5}  # KST 05시 차단 — 13건 손실/큰 손실 5건 집중 (전 시간대 최악)
 BLACKLIST = {'BRUSDT', 'SIRENUSDT', 'XAUUSDT', 'XAGUSDT', 'RIVERUSDT', 'SIGNUSDT', 'PAXGUSDT', 'BSBUSDT',
              'A2ZUSDT', 'PTBUSDT', 'VIDTUSDT', 'MEMEFIUSDT', 'AMBUSDT', 'TROYUSDT', 'LEVERUSDT', 'NOMUSDT',
              'PORT3USDT', 'NEIROETHUSDT', 'BSWUSDT', 'AGIXUSDT', 'SXPUSDT',
@@ -64,7 +64,7 @@ _tp_cache = {}  # {symbol: tp_price}
 # 트레일링 스탑: 최고/최저 가격 추적
 _trail_peak = {}  # {symbol: best_price_so_far}
 _trail_atr = {}   # {symbol: ATR(1h)} — 트레일링 활성화 시 캐시
-TRAIL_ACTIVATE_PCT = 1.5  # 수익 1.5%부터 트레일링 활성화 (CVD는 느리게 오르므로 여유)
+TRAIL_ACTIVATE_PCT = 0.8  # 수익 0.8%부터 트레일링 활성화 (BB롱 중앙값 0.7% 커버)
 # #159 상장 숏 설정
 LISTING_SHORT_USDT = 10     # 소액 $10
 LISTING_SHORT_LEV = 2       # 레버리지 2x
@@ -74,8 +74,8 @@ LISTING_SHORT_TP_PCT = 5.0  # TP: 진입 대비 -5% (레버리지 반영 10% 수
 TRAIL_ATR_TIERS = [
     (5.0, 0.2),   # 수익 5%+ → ATR × 0.2 (타이트, 수익 확보)
     (3.0, 0.3),   # 수익 3~5% → ATR × 0.3 (부분 익절 후 구간)
-    (1.5, 0.5),   # 수익 1.5~3% → ATR × 0.5 (#142: 0.3→0.5, 수익 더 달리게)
-    (0.7, 0.6),   # 수익 0.7~1.5% → ATR × 0.6 (#142: 0.4→0.6, 조기 청산 방지)
+    (1.5, 0.5),   # 수익 1.5~3% → ATR × 0.5
+    (0.8, 0.7),   # 수익 0.8~1.5% → ATR × 0.7 (BB롱 수익권 보호, 넓게)
 ]
 TRAIL_MIN_PCT = 0.5   # 최소 트레일 거리 0.5% (0.3%는 수수료 포함 시 본전)
 TRAIL_MAX_PCT = 3.0   # 최대 트레일 거리 3.0% (극변동 종목 캡)
@@ -86,7 +86,7 @@ COOLDOWN_SEC = 1800  # 30분
 COOLDOWN_LOSS_SEC = 7200  # 동일 종목 손실 시 2시간 쿨다운
 _cooldown = {}  # {symbol: expire_time}
 # BTC 지표 캐시 (사이클당 1회만 조회)
-_btc_cache = {'ts': 0, 'up': True, 'rsi': 50}
+_btc_cache = {'ts': 0, 'up': True, 'rsi': 50, 'rsi_prev3': 50}
 # 텔레그램 전송 주기 (분석은 5분, 알림은 30분)
 TG_INTERVAL = 1800  # 30분
 _last_tg_time = 0
@@ -100,6 +100,7 @@ _listing_done = set()  # 이미 숏 진입한 종목 (세션 내 중복 방지)
 # 일일 거래 횟수 + 연속 손실 추적
 _daily_trades = {'date': '', 'count': 0}
 _consecutive_losses = 0
+_global_cooldown_until = 0  # 연패 쿨다운 만료 시각 (time.time)
 # #J/K: 하락장 전용 안전장치
 _bear_daily_loss = {'date': '', 'total': 0.0}  # 하락장 일일 손실 누적
 _bear_stopped = False  # 하락장 당일 거래 정지 플래그
@@ -115,6 +116,7 @@ BB_BOX_LOG = '/home/hyeok/01.APCC/00.ai-lab/bb_box_signals.jsonl'
 # ── BB 숏 (상단 매도) ──
 _bb_short_cache = {'ts': 0}
 _bb_short_limit_orders = {}  # {symbol: {'order_id': ..., ...}}
+_bb_short_cooldown = {}  # {symbol: exit_timestamp} — 동일 종목 4시간 재진입 방지
 BB_SHORT_USDT = 20  # 롱보다 보수적
 BB_SHORT_LOG = '/home/hyeok/01.APCC/00.ai-lab/bb_short_signals.jsonl'
 # ── 추세 추종 숏 (하락장) ──
@@ -123,8 +125,27 @@ TREND_SHORT_USDT = 20
 TREND_SHORT_LOG = '/home/hyeok/01.APCC/00.ai-lab/trend_short_signals.jsonl'
 # ── 역행 과매수 숏 (하락장에서 혼자 오른 알트) ──
 _contrarian_short_cache = {'ts': 0}
-CONTRARIAN_SHORT_USDT = 25
+CONTRARIAN_SHORT_USDT = 35
 CONTRARIAN_SHORT_LOG = '/home/hyeok/01.APCC/00.ai-lab/contrarian_short_signals.jsonl'
+# ── 모멘텀 브레이크아웃 (중립장 추세 초기 롱) ──
+_momentum_cache = {'ts': 0}
+MOMENTUM_USDT = 15  # 소액 검증 ($15)
+MOMENTUM_LOG = '/home/hyeok/01.APCC/00.ai-lab/momentum_signals.jsonl'
+# ── 급등 과매수 숏 (24h 급등 종목 역행) ──
+_surge_short_cache = {'ts': 0}
+SURGE_SHORT_USDT = 20  # STO +$6.10 실증 → $20
+SURGE_SHORT_LOG = '/home/hyeok/01.APCC/00.ai-lab/surge_short_signals.jsonl'
+# ── 메가 급등 실시간 캐치 (30초 주기, 24h +80%+) ──
+_surge_entered_today = set()  # 당일 급등숏 진입 종목 (중복 방지)
+_quick_surge_date = ''        # 날짜 바뀌면 리셋
+
+# ── 킬존 시간대 부스트 (런던/뉴욕 오픈 = 변동성↑) ──
+def _get_killzone_boost():
+    """UTC 기반 킬존 진입금 배수. 런던(07~10 UTC)/뉴욕(12~15 UTC) = 1.2x"""
+    _utc_h = datetime.now(timezone.utc).hour
+    if 7 <= _utc_h < 10 or 12 <= _utc_h < 15:  # 킬존
+        return 1.2
+    return 1.0
 
 # ── 기관 매매법 전략 변수 ──
 # #L: CVD 다이버전스
@@ -176,10 +197,18 @@ def get_btc_trend():
     if now - _btc_cache['ts'] < 250:  # 4분 캐시
         return _btc_cache['up'], _btc_cache['rsi']
     try:
-        btc = calc_indicators(get_klines('BTCUSDT', '1h', 60))
+        df = get_klines('BTCUSDT', '1h', 60)
+        btc = calc_indicators(df)
         up = (btc.get('ema20', 0) or 0) > (btc.get('ema50', 0) or 0)
         rsi = btc.get('rsi', 50) or 50
-        _btc_cache.update({'ts': now, 'up': up, 'rsi': rsi})
+        # BTC RSI 3캔들 전 값 (방향성 판단용, API 호출 없음)
+        try:
+            import pandas_ta as ta
+            _rsi_s = ta.rsi(df['close'], length=14)
+            rsi_prev3 = float(_rsi_s.iloc[-4]) if _rsi_s is not None and len(_rsi_s) >= 4 else rsi
+        except Exception:
+            rsi_prev3 = rsi
+        _btc_cache.update({'ts': now, 'up': up, 'rsi': rsi, 'rsi_prev3': rsi_prev3})
         return up, rsi
     except Exception:
         return _btc_cache['up'], _btc_cache['rsi']
@@ -906,8 +935,18 @@ def check_fills():
                 pos = [p for p in _get_positions_cached() if p['symbol'] == sym][0]
                 qty = float(pos.get('size', 0))
                 if qty > 0:
-                    place_sl_tp(sym, info['side'], qty,
+                    _sltp_result = place_sl_tp(sym, info['side'], qty,
                                 sl_price=info['sl'], tp_price=info['tp'])
+                    # SL 실패 시 긴급 청산 — 보호 없는 포지션 방치 방지
+                    if not _sltp_result.get('sl_placed'):
+                        log(f"  🚨 {sym} SL 배치 실패! 긴급 청산")
+                        _close_side = 'SELL' if info['side'] == 'BUY' else 'BUY'
+                        try:
+                            client.futures_create_order(symbol=sym, side=_close_side, type='MARKET',
+                                quantity=str(qty), reduceOnly=True)
+                        except: pass
+                        filled.append(sym)
+                        continue
                     _sltp_done.add(sym)
                     _tp_cache[sym] = info['tp']
                     # 기관 전략은 _institutional_post_entry에서 이미 카운트 → updater만 여기서 증가
@@ -926,7 +965,7 @@ def check_fills():
                             "atr": info.get('atr', 0),
                             "confidence": abs(info.get('score', 0)),
                             "source": info.get('source', 'updater'),
-                            "extra": json.dumps({"score": info.get('score',0), "btc_up": _btc_cache.get('up', True), "btc_rsi": round(_btc_cache.get('rsi', 50)), "rl": info.get('rl_signal', 'none')}),
+                            "extra": json.dumps({"score": info.get('score',0), "btc_up": _btc_cache.get('up', True), "btc_rsi": round(_btc_cache.get('rsi', 50)), "rl": info.get('rl_signal', 'none'), "cvd_delta": info.get('cvd_delta', None)}),
                         })
                     except Exception:
                         pass
@@ -938,7 +977,12 @@ def check_fills():
                     except Exception:
                         pass
             except Exception as e:
-                log(f"  ⚠️ {sym} SL/TP 실패: {e}")
+                log(f"  🚨 {sym} 체결 처리 실패: {e} — 긴급 청산 시도")
+                try:
+                    _close_side = 'SELL' if info['side'] == 'BUY' else 'BUY'
+                    client.futures_create_order(symbol=sym, side=_close_side, type='MARKET',
+                        quantity=str(qty), reduceOnly=True)
+                except: pass
             filled.append(sym)
     for sym in filled:
         del _pending_fills[sym]
@@ -1021,8 +1065,8 @@ def check_partial_tp():
             sym = pos['symbol']
             if sym in _partial_done:
                 continue
-            # BB/추세숏: 전량 TP → 부분 익절 불필요
-            if _entry_source.get(sym) in ('bb_box', 'bb_short', 'trend_short', 'contrarian_short'):
+            # 추세숏: 전량 TP → 부분 익절 불필요 (BB롱/역행숏/bb_short는 부분익절 허용)
+            if _entry_source.get(sym) in ('trend_short',):
                 continue
             entry = float(pos.get('entry_price', 0))
             qty = float(pos.get('size', 0))
@@ -1050,7 +1094,8 @@ def check_partial_tp():
             else:
                 pnl_real = (entry - cur) / entry * 100 * lev
 
-            if pnl_real >= 3.0:
+            # 부분익절 임계값: BB롱 중앙값 0.7%(1x) → 2% real이면 대부분 커버
+            if pnl_real >= 2.0:
                 half_qty = _round_qty(sym, qty / 2)
                 if half_qty <= 0:
                     continue
@@ -1196,8 +1241,8 @@ def check_trailing_stop():
             side = pos.get('side', 'LONG')
             if entry <= 0 or qty <= 0:
                 continue
-            # BB/추세숏: 전량 TP에 의존 → 트레일링 스킵
-            if _entry_source.get(sym) in ('bb_box', 'bb_short', 'trend_short', 'contrarian_short'):
+            # 추세숏: 전량 TP에 의존 → 트레일링 스킵 (BB롱/역행숏/bb_short는 트레일링 허용)
+            if _entry_source.get(sym) in ('trend_short',):
                 continue
 
             cur = get_price(sym)
@@ -1305,7 +1350,7 @@ def check_stale_position():
             _src = _entry_source.get(sym, 'updater')
             # CVD는 큰 수익 평균 10h → stale 조임 6h로 여유. BB/추세 4h, 나머지 2h
             if _src == 'cvd_divergence': _stale_sec = 21600  # 6h
-            elif _src in ('bb_box', 'bb_short', 'trend_short', 'contrarian_short'): _stale_sec = 14400  # 4h
+            elif _src in ('bb_box', 'bb_short', 'trend_short', 'contrarian_short', 'momentum_breakout', 'surge_short', 'mega_surge'): _stale_sec = 14400  # 4h
             else: _stale_sec = 7200  # 2h
             held_sec = now - _entry_time.get(sym, now)
             if held_sec < _stale_sec:
@@ -1420,7 +1465,7 @@ def check_long_hold():
             _source = _entry_source.get(sym, 'updater')
             # CVD 12h, BB/추세숏 8h, 나머지 6h
             if _source == 'cvd_divergence': _max_hold = 12 * 3600
-            elif _source in ('bb_box', 'bb_short', 'trend_short', 'contrarian_short'): _max_hold = 8 * 3600
+            elif _source in ('bb_box', 'bb_short', 'trend_short', 'contrarian_short', 'momentum_breakout', 'surge_short', 'mega_surge'): _max_hold = 8 * 3600
             else: _max_hold = 6 * 3600
             if held_sec >= _max_hold:
                 trend_broken = True
@@ -2535,7 +2580,7 @@ def _institutional_post_entry(sym, source):
         _daily_trades['count'] = 0
     _daily_trades['count'] += 1
     # BB 박스 롱/숏: 15분 쿨다운 (횡보장 왕복 재진입 허용), 나머지: 30분
-    _cd = 900 if source in ('bb_box', 'bb_short', 'trend_short', 'contrarian_short') else COOLDOWN_SEC
+    _cd = 900 if source in ('bb_box', 'bb_short', 'trend_short', 'contrarian_short', 'momentum_breakout', 'surge_short', 'mega_surge') else COOLDOWN_SEC
     _cooldown[sym] = time.time() + _cd
 
 def check_bb_box():
@@ -2555,7 +2600,13 @@ def check_bb_box():
 
     # 하락장 필터: BTC RSI < 40 + ADX > 25이면 BB 롱 스킵 (역추세 방지)
     _btc_rsi = _btc_cache.get('rsi', 50)
-    if _btc_rsi < 50:  # 40→50 (BTC가 중립 이상일 때만 롱)
+    if _btc_rsi < 45:  # 50→45 (BB 롱은 CVD와 동일 기준)
+        return
+    # BTC RSI 하락 모멘텀 필터: 3시간 동안 -5pt 이상 하락이면 BB롱 스킵
+    _btc_rsi_prev3 = _btc_cache.get('rsi_prev3', _btc_rsi)
+    _btc_rsi_slope = _btc_rsi - _btc_rsi_prev3
+    if _btc_rsi_slope < -5:
+        log(f"  ⏸ BB롱 스킵: BTC RSI 하락 모멘텀 ({_btc_rsi_prev3:.0f}→{_btc_rsi:.0f}, slope={_btc_rsi_slope:.1f})")
         return
 
     try:
@@ -2579,6 +2630,7 @@ def check_bb_box():
                 px = float(get_price(sym))
                 _bb_bottom_count = 0
                 _bb_1h = None
+                _bb_adx = 0  # ADX 필터용
 
                 for _tf in ['15m', '30m', '1h']:
                     _ind = calc_indicators(get_klines(sym, _tf, 50))
@@ -2591,6 +2643,7 @@ def check_bb_box():
                     if -5 < _pos < 20:
                         _bb_bottom_count += 1
                     if _tf == '1h':
+                        _bb_adx = _ind.get('adx', 0) or 0
                         _bb_1h = {
                             'upper': _bu, 'lower': _bl, 'mid': _bm,
                             'pos': _pos, 'width': (_bu - _bl) / _bm * 100,
@@ -2599,6 +2652,9 @@ def check_bb_box():
                         }
 
                 if not _bb_1h:
+                    continue
+                # ADX >= 20이면 추세장 → BB 반전 부적합 (최근 3일 0승3패 모두 추세장)
+                if _bb_adx >= 20:
                     continue
                 rsi = _bb_1h['rsi']
                 atr = _bb_1h['atr']
@@ -2609,10 +2665,10 @@ def check_bb_box():
                 bb_pos = _bb_1h['pos']
                 if rsi != rsi: continue  # nan
 
-                # 조건: 1h 박스권(폭 1~4%) + 2/3 TF 하단 합의 + RSI 횡보(30~55)
-                is_box = 1.5 < bb_width < 5.5  # 백테스트 1위: 1.5~5.5%
+                # 조건: 1h 박스권(폭 2~5.5%) + 3/3 TF 하단 합의 + RSI 과매도(30~50)
+                is_box = 2.0 < bb_width < 5.5  # 폭 1.5→2.0 (좁은 밴드 R:R 불리)
                 is_mtf_bottom = _bb_bottom_count >= 3  # 3/3 전 TF 합의 (보수적)
-                is_sideways_rsi = 30 < rsi < 55  # 백테스트 1위: 55
+                is_sideways_rsi = 30 < rsi < 50  # 55→50 (중립 제외, 과매도만)
 
                 is_signal = is_box and is_mtf_bottom and is_sideways_rsi
 
@@ -2675,7 +2731,9 @@ def check_bb_box():
                 if _daily_trades.get('date') == _today and _daily_trades.get('count', 0) >= MAX_DAILY_TRADES:
                     break
 
-                usdt = max(ALT_USDT * (0.7 if _bear_mode else 1.0), 12)
+                # BB롱 진입금: 잔고 30%, 최대 $40 × 킬존 부스트
+                _bal = get_balance() or 100
+                usdt = max(min(_bal * 0.30, 40) * (0.7 if _bear_mode else 1.0) * _get_killzone_boost(), 12)
                 lev = ETH_LEV if sym == 'ETHUSDT' else ALT_LEV
                 try:
                     set_margin_type(sym, "ISOLATED")
@@ -2689,8 +2747,8 @@ def check_bb_box():
                     # #A: SL을 BB 하단 -0.5%로 고정 (박스 이탈 시에만 손절)
                     sl_pct_bb = abs(px - best['bb_lower']) / px * 100 + 0.5
                     sl_pct = max(sl_pct_bb, 1.5 / lev)  # 최소 레버리지 보호
-                    # TP를 BB 상단 (백테스트 1위: upper가 mid보다 +$14.63)
-                    tp = _round_price_sym(sym, best['bb_upper'])
+                    # TP: BB 중간선 (상단 도달률 5% → 중간선 + 부분익절/트레일링으로 전환)
+                    tp = _round_price_sym(sym, best['bb_mid'])
                     if best['bb_upper'] <= px * 1.01:
                         continue
                     _mtf = best.get('mtf_bottom', 0)
@@ -2716,6 +2774,9 @@ def check_bb_box():
                         _sl_dist = abs(px - sl)
                         _tp_dist = abs(tp - px)
                         _rr = _tp_dist / _sl_dist if _sl_dist else 0
+                        if _rr < 0.8:
+                            log(f"  ⛔ BB롱 R:R {_rr:.2f} < 0.8 → 스킵 ({sym})")
+                            continue
 
                         order = client.futures_create_order(symbol=sym, side='BUY', type='MARKET', quantity=str(qty), newClientOrderId=f'bb_{uuid.uuid4().hex[:16]}')
                         _positions_cache['ts'] = 0
@@ -2769,6 +2830,9 @@ def check_bb_box():
                         _sl_dist = abs(limit_px - sl)
                         _tp_dist = abs(tp - limit_px)
                         _rr = _tp_dist / _sl_dist if _sl_dist else 0
+                        if _rr < 0.8:
+                            log(f"  ⛔ BB롱예약 R:R {_rr:.2f} < 0.8 → 스킵 ({sym})")
+                            continue
 
                         if sym in _bb_limit_orders:
                             _old = _bb_limit_orders[sym]
@@ -2799,6 +2863,553 @@ def check_bb_box():
         log(f"  BB 박스 오류: {e}")
 
 
+def check_momentum_breakout():
+    """
+    모멘텀 브레이크아웃 롱 — BB 중립장(40~80%)에서 추세 초기 합류
+    기존 전략 사각지대 (BB롱: BB<20, CVD: RSI<30, 숏: BTC RSI<55) 커버
+    조건: ADX>25 + EMA정배열 + RSI 50~68 + MACD hist>0 + BTC RSI 45~65
+    """
+    global _momentum_cache
+    now = time.time()
+    if now - _momentum_cache['ts'] < 300:
+        return
+    _momentum_cache['ts'] = now
+
+    ok, reason = _institutional_guard()
+    if not ok:
+        return
+
+    # BTC RSI 45~65만 (기존 전략 비활성 구간)
+    _btc_rsi = _btc_cache.get('rsi', 50)
+    if _btc_rsi < 45 or _btc_rsi > 65:
+        return
+    _btc_rsi_prev3 = _btc_cache.get('rsi_prev3', _btc_rsi)
+    if (_btc_rsi - _btc_rsi_prev3) < -3:
+        return  # BTC RSI 급락 중
+
+    try:
+        client = get_client()
+        held = get_held_symbols()
+        if len(held) >= MAX_ORDERS:
+            return
+
+        symbols = [s for s in get_scan_universe() if s not in {'BTCUSDT'}]
+        signals = []
+
+        for sym in symbols:
+            if sym in held or sym in BLACKLIST or sym in WEAK_SYMBOLS:
+                continue
+            if _check_already_held(sym):
+                continue
+            if sym in _cooldown and time.time() < _cooldown[sym]:
+                continue
+
+            try:
+                ind = calc_indicators(get_klines(sym, '1h', 50))
+                px = float(get_price(sym))
+
+                rsi = ind.get('rsi', 50) or 50
+                adx = ind.get('adx', 0) or 0
+                dmp = ind.get('adx_dmp', 0) or 0
+                dmn = ind.get('adx_dmn', 0) or 0
+                ema20 = ind.get('ema20', 0) or 0
+                ema50 = ind.get('ema50', 0) or 0
+                macd_hist = ind.get('macd_hist', 0) or 0
+                atr = ind.get('atr', 0) or 0
+                bb_upper = ind.get('bb_upper', 0) or 0
+                bb_lower = ind.get('bb_lower', 0) or 0
+
+                if not (bb_upper > bb_lower > 0 and ema50 > 0 and px > 0):
+                    continue
+
+                bb_pos = (px - bb_lower) / (bb_upper - bb_lower) * 100
+
+                # 7개 조건 모두 충족
+                is_signal = (
+                    adx > 25 and dmp > dmn and       # 상승 추세
+                    50 < rsi < 68 and                 # 초기 강세
+                    40 < bb_pos < 80 and              # 중립장
+                    ema20 > ema50 and                 # 정배열
+                    macd_hist > 0                     # 상승 모멘텀
+                )
+
+                # 로그 (부분 충족도 기록)
+                if adx > 25 and dmp > dmn and (50 < rsi < 68 or 40 < bb_pos < 80):
+                    try:
+                        with open(MOMENTUM_LOG, 'a') as f:
+                            f.write(json.dumps({
+                                "time": datetime.now().strftime('%Y-%m-%d %H:%M'),
+                                "symbol": sym, "price": round(px, 4),
+                                "adx": round(adx, 1), "dmp": round(dmp, 1), "dmn": round(dmn, 1),
+                                "rsi": round(rsi, 1), "bb_pos": round(bb_pos, 1),
+                                "macd_hist": round(macd_hist, 6),
+                                "ema20": round(ema20, 4), "ema50": round(ema50, 4),
+                                "signal": is_signal,
+                            }) + '\n')
+                    except Exception:
+                        pass
+
+                if not is_signal:
+                    continue
+
+                # 24h 거래량 필터
+                _kl_vol = get_klines(sym, '1h', 24)
+                _vol_24h = (_kl_vol['volume'] * _kl_vol['close']).sum() if len(_kl_vol) > 0 else 0
+                if _vol_24h < 100_000_000:
+                    continue
+
+                signals.append({
+                    'symbol': sym, 'price': px, 'rsi': rsi,
+                    'adx': adx, 'bb_pos': bb_pos,
+                    'bb_upper': bb_upper, 'ema50': ema50,
+                    'atr': atr,
+                })
+
+            except Exception:
+                continue
+
+        if signals and len(held) < MAX_ORDERS:
+            ranked = sorted(signals, key=lambda x: -x['adx'])
+
+            for best in ranked[:1]:
+                sym = best['symbol']
+                _today = datetime.now().strftime('%Y-%m-%d')
+                if _daily_trades.get('date') == _today and _daily_trades.get('count', 0) >= MAX_DAILY_TRADES:
+                    break
+
+                # 모멘텀 진입금: 잔고의 15%, 최대 $25 × 킬존 부스트
+                _bal = get_balance() or 100
+                usdt = max(min(_bal * 0.15, 25) * _get_killzone_boost(), 15)
+                lev = ETH_LEV if sym == 'ETHUSDT' else ALT_LEV
+                try:
+                    set_margin_type(sym, "ISOLATED")
+                    set_leverage(sym, lev)
+                    px = float(get_price(sym))
+                    atr = best['atr']
+
+                    # SL: EMA50 - 0.3% (추세 이탈 시 손절)
+                    _sl_ema = best['ema50'] * 0.997
+                    _atr_pct = atr / px * 100 if px else 1
+                    _sl_atr = px * (1 - max(_atr_pct, 1.5) / 100)
+                    sl = _round_price_sym(sym, min(_sl_ema, _sl_atr))
+                    # SL 최대 3%
+                    if abs(px - sl) / px > 0.03:
+                        sl = _round_price_sym(sym, px * 0.97)
+
+                    # TP: BB 상단
+                    tp = _round_price_sym(sym, best['bb_upper'])
+
+                    # R:R 최소 1.5
+                    _sl_dist = abs(px - sl)
+                    _tp_dist = abs(tp - px)
+                    _rr = _tp_dist / _sl_dist if _sl_dist else 0
+                    if _rr < 1.5:
+                        continue
+
+                    # LIMIT 진입 (ATR × 0.15 오프셋)
+                    _offset = min(max(atr * 0.15 / px if px else 0.002, 0.001), 0.004)
+                    limit_px = _round_price_sym(sym, px * (1 - _offset))
+
+                    qty = _round_qty(sym, usdt * lev / limit_px)
+                    if qty <= 0 or qty * limit_px < 20:
+                        step, _ = _get_symbol_filters(sym)
+                        qty = _round_qty(sym, 21.0 / limit_px + float(step))
+                    if qty <= 0:
+                        continue
+
+                    # 손실 캡
+                    _sl_dist_pct = abs(limit_px - sl) / limit_px * 100
+                    _max_usdt = MAX_LOSS_PER_TRADE / (lev * _sl_dist_pct / 100) if _sl_dist_pct > 0 else usdt
+                    if usdt > _max_usdt:
+                        usdt = _max_usdt
+                        qty = _round_qty(sym, usdt * lev / limit_px)
+
+                    order = client.futures_create_order(
+                        symbol=sym, side='BUY', type='LIMIT',
+                        price=str(limit_px), quantity=str(qty), timeInForce='GTC',
+                        newClientOrderId=f'mb_{uuid.uuid4().hex[:16]}')
+                    _pending_fills[sym] = {
+                        'order_id': order['orderId'], 'sl': sl, 'tp': tp,
+                        'side': 'BUY', 'entry': limit_px, 'score': 0, 'atr': atr,
+                        'time': time.time(), 'source': 'momentum_breakout', 'expire': time.time() + 600,
+                    }
+                    log(f"  🚀 모멘텀 진입: {sym} @ {limit_px} ADX={best['adx']:.0f} RSI={best['rsi']:.0f} BB={best['bb_pos']:.0f}%")
+                    send_message(TG_TOKEN, TG_CHAT,
+                        f"🚀 <b>모멘텀 브레이크아웃</b>\n"
+                        f"   {sym} @ ${limit_px}\n"
+                        f"   ADX={best['adx']:.0f} RSI={best['rsi']:.0f} BB={best['bb_pos']:.0f}%\n"
+                        f"   BTC RSI {_btc_rsi:.0f}\n"
+                        f"   SL ${sl} → TP ${tp} | R:R 1:{_rr:.1f}")
+                    _institutional_post_entry(sym, 'momentum_breakout')
+                    break
+
+                except Exception as e:
+                    log(f"  ❌ 모멘텀 실패: {e}")
+
+    except Exception as e:
+        log(f"  모멘텀 오류: {e}")
+
+
+def check_surge_short():
+    """
+    급등 과매수 숏 — 24h 급등(+30%+) + RSI 80+ 종목 역행 숏
+    STO +$6.10 실증 패턴 자동화. BTC RSI 무관 (급등 자체가 시그널)
+    기존 역행숏(contrarian_short)은 BTC RSI<45 제한 → 이 전략은 독립 작동
+    """
+    global _surge_short_cache
+    now = time.time()
+    if now - _surge_short_cache['ts'] < 300:
+        return
+    _surge_short_cache['ts'] = now
+
+    ok, reason = _institutional_guard()
+    if not ok:
+        return
+    # 연패 쿨다운 체크 (_quick_surge_scan과 동일)
+    if time.time() < _global_cooldown_until or _bear_stopped:
+        return
+
+    try:
+        client = get_client()
+        held = get_held_symbols()
+        if len(held) >= MAX_ORDERS:
+            return
+
+        # 24h 티커에서 급등 종목 필터
+        tickers = {t['symbol']: t for t in client.futures_ticker()}
+        signals = []
+
+        for sym, t in tickers.items():
+            if not sym.endswith('USDT') or sym in BLACKLIST or sym in WEAK_SYMBOLS:
+                continue
+            if sym in held or _check_already_held(sym):
+                continue
+            if sym in _cooldown and time.time() < _cooldown[sym]:
+                continue
+
+            chg_24h = float(t.get('priceChangePercent', 0))
+            vol = float(t.get('quoteVolume', 0))
+
+            # 24h +30%+ 급등 + 거래량 $50M+ (유동성)
+            if chg_24h < 30 or vol < 50_000_000:
+                continue
+
+            try:
+                ind = calc_indicators(get_klines(sym, '1h', 50))
+                px = float(get_price(sym))
+                rsi = ind.get('rsi', 50) or 50
+                adx = ind.get('adx', 0) or 0
+                bbu = ind.get('bb_upper', 0) or 0
+                bbl = ind.get('bb_lower', 0) or 0
+                bbm = ind.get('bb_mid', 0) or 0
+                atr = ind.get('atr', 0) or 0
+
+                if not (bbu > bbl > 0 and px > 0):
+                    continue
+                bb_pos = (px - bbl) / (bbu - bbl) * 100
+
+                # 조건: RSI 80+ (극과매수) + BB 100%+ (밴드 상단 이탈)
+                is_signal = rsi > 80 and bb_pos > 95
+
+                # 로그 (30%+ 급등이면 무조건 기록)
+                try:
+                    with open(SURGE_SHORT_LOG, 'a') as f:
+                        f.write(json.dumps({
+                            "time": datetime.now().strftime('%Y-%m-%d %H:%M'),
+                            "symbol": sym, "price": round(px, 4),
+                            "chg_24h": round(chg_24h, 1), "rsi": round(rsi, 1),
+                            "adx": round(adx, 1), "bb_pos": round(bb_pos, 1),
+                            "vol_m": round(vol / 1e6, 0),
+                            "signal": is_signal,
+                        }) + '\n')
+                except Exception:
+                    pass
+
+                if not is_signal:
+                    continue
+
+                # 오더북 매도벽 확인 (매도 > 매수 = 하락 압력)
+                try:
+                    ob = client.futures_order_book(symbol=sym, limit=10)
+                    bid = sum(float(b[1]) for b in ob['bids'][:5])
+                    ask = sum(float(a[1]) for a in ob['asks'][:5])
+                    _imbalance = (bid - ask) / (bid + ask) * 100 if (bid + ask) else 0
+                    if _imbalance > 20:  # 매수벽 강하면 스킵 (숏 스퀴즈 위험)
+                        log(f"  ⚠️ {sym} 급등숏 스킵: 매수벽 {_imbalance:+.0f}%")
+                        continue
+                except Exception:
+                    pass
+
+                signals.append({
+                    'symbol': sym, 'price': px, 'rsi': rsi,
+                    'adx': adx, 'bb_pos': bb_pos, 'chg_24h': chg_24h,
+                    'bb_upper': bbu, 'bb_mid': bbm, 'atr': atr,
+                })
+
+            except Exception:
+                continue
+
+        if signals and len(held) < MAX_ORDERS:
+            # RSI 높은 순 (가장 과매수인 종목 우선)
+            ranked = sorted(signals, key=lambda x: -x['rsi'])
+
+            for best in ranked[:1]:
+                sym = best['symbol']
+                _today = datetime.now().strftime('%Y-%m-%d')
+                if _daily_trades.get('date') == _today and _daily_trades.get('count', 0) >= MAX_DAILY_TRADES:
+                    break
+
+                # 급등숏 진입금: 잔고의 20%, 최대 $30 × 킬존 부스트
+                _bal = get_balance() or 100
+                usdt = max(min(_bal * 0.20, 30) * _get_killzone_boost(), 15)
+                lev = ALT_LEV
+                try:
+                    set_margin_type(sym, "ISOLATED")
+                    set_leverage(sym, lev)
+                    px = float(get_price(sym))
+                    atr = best['atr']
+
+                    # SL: BB 상단 +0.5% (급등 종목은 SL 넓게)
+                    sl = _round_price_sym(sym, best['bb_upper'] * 1.005)
+                    # SL 최대 5% 캡
+                    if abs(sl - px) / px > 0.05:
+                        sl = _round_price_sym(sym, px * 1.05)
+                    # SL 최소 2%
+                    if abs(sl - px) / px < 0.02:
+                        sl = _round_price_sym(sym, px * 1.02)
+
+                    # TP: BB 중간선 (과매수 해소 목표)
+                    tp = _round_price_sym(sym, best['bb_mid'])
+                    if tp >= px * 0.99:
+                        continue  # TP 너무 가까움
+
+                    # R:R 체크
+                    _sl_dist = abs(sl - px)
+                    _tp_dist = abs(px - tp)
+                    _rr = _tp_dist / _sl_dist if _sl_dist else 0
+                    if _rr < 1.5:
+                        continue
+
+                    # 수량 계산 + 손실 캡
+                    qty = _round_qty(sym, usdt * lev / px)
+                    if qty <= 0 or qty * px < 20:
+                        step, _ = _get_symbol_filters(sym)
+                        qty = _round_qty(sym, 21.0 / px + float(step))
+                    if qty <= 0:
+                        continue
+
+                    _sl_dist_pct = abs(sl - px) / px * 100
+                    _max_usdt = MAX_LOSS_PER_TRADE / (lev * _sl_dist_pct / 100) if _sl_dist_pct > 0 else usdt
+                    if usdt > _max_usdt:
+                        usdt = _max_usdt
+                        qty = _round_qty(sym, usdt * lev / px)
+
+                    # 시장가 즉시 진입 (급등 종목은 빠르게 반전 가능)
+                    order = client.futures_create_order(
+                        symbol=sym, side='SELL', type='MARKET',
+                        quantity=str(qty), newClientOrderId=f'ss_{uuid.uuid4().hex[:16]}')
+
+                    # SL/TP 즉시 배치
+                    import time as _t; _t.sleep(0.3)
+                    try:
+                        client.futures_create_order(symbol=sym, side='BUY', type='STOP_MARKET',
+                            stopPrice=str(sl), quantity=str(qty), reduceOnly=True)
+                    except: pass
+                    try:
+                        client.futures_create_order(symbol=sym, side='BUY', type='TAKE_PROFIT_MARKET',
+                            stopPrice=str(tp), quantity=str(qty), reduceOnly=True)
+                    except: pass
+
+                    _entry_source[sym] = 'surge_short'
+                    _entry_time[sym] = time.time()
+                    _tp_cache[sym] = tp
+
+                    # DB 기록
+                    try:
+                        trade_db.record_trade({
+                            "time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                            "symbol": sym, "side": "🔴 숏", "action": "진입",
+                            "qty": qty, "price": px, "sl": sl, "tp": tp, "atr": atr,
+                            "confidence": 0, "source": "surge_short",
+                            "extra": json.dumps({"chg_24h": round(best['chg_24h'], 1), "rsi": round(best['rsi']), "adx": round(best['adx']), "bb_pos": round(best['bb_pos'])}),
+                        })
+                    except: pass
+
+                    log(f"  🔥 급등숏 진입: {sym} @ {px} 24h{best['chg_24h']:+.0f}% RSI={best['rsi']:.0f} R:R=1:{_rr:.1f}")
+                    send_message(TG_TOKEN, TG_CHAT,
+                        f"🔥 <b>급등 과매수 숏</b>\n"
+                        f"   {sym} @ ${px} (24h {best['chg_24h']:+.0f}%)\n"
+                        f"   RSI={best['rsi']:.0f} BB={best['bb_pos']:.0f}% ADX={best['adx']:.0f}\n"
+                        f"   SL ${sl} → TP ${tp} | R:R 1:{_rr:.1f}")
+                    _sltp_done.add(sym)  # verify_sltp 덮어쓰기 방지
+                    _institutional_post_entry(sym, 'surge_short')
+                    break
+
+                except Exception as e:
+                    log(f"  ❌ 급등숏 실패: {e}")
+
+    except Exception as e:
+        log(f"  급등숏 오류: {e}")
+
+
+def _quick_surge_scan():
+    """30초 주기 경량 급등 캐치 — 24h +80%+ 종목 즉시 숏
+    position_updater 메인 루프의 30초 트레일링 체크에 통합.
+    STO +173% → +$6.10 패턴 자동화. BB 조건 없음 (급등 시 BB 무의미)."""
+    global _surge_entered_today, _quick_surge_date
+
+    # 안전장치: 야간/한도/마진 + 연패 쿨다운 체크
+    ok, reason = _institutional_guard()
+    if not ok:
+        return
+    if time.time() < _global_cooldown_until or _bear_stopped:
+        return
+
+    # 날짜 리셋
+    _today = datetime.now().strftime('%Y-%m-%d')
+    if _quick_surge_date != _today:
+        _quick_surge_date = _today
+        _surge_entered_today = set()
+
+    try:
+        held = get_held_symbols()
+        if len(held) >= MAX_ORDERS:
+            return
+
+        client = get_client()
+        tickers = client.futures_ticker()  # API 1회 — 전 종목 24h 데이터
+
+        for t in tickers:
+            sym = t['symbol']
+            if not sym.endswith('USDT') or sym in BLACKLIST or sym in WEAK_SYMBOLS:
+                continue
+            if sym in _surge_entered_today or sym in held:
+                continue
+            if _check_already_held(sym):
+                continue
+            if sym in _cooldown and time.time() < _cooldown[sym]:
+                continue
+
+            chg = float(t.get('priceChangePercent', 0))
+            vol = float(t.get('quoteVolume', 0))
+
+            # 24h +80%+ AND 거래량 $50M+
+            if chg < 80 or vol < 50_000_000:
+                continue
+
+            try:
+                # 15m RSI만 빠르게 확인 (1h 대비 반응 2배 빠름)
+                ind = calc_indicators(get_klines(sym, '15m', 30))
+                rsi_15m = ind.get('rsi', 50) or 50
+
+                # 로그 (80%+ 급등이면 무조건 기록)
+                try:
+                    with open(SURGE_SHORT_LOG, 'a') as f:
+                        f.write(json.dumps({
+                            "time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                            "symbol": sym, "chg_24h": round(chg, 1),
+                            "rsi_15m": round(rsi_15m, 1), "vol_m": round(vol / 1e6),
+                            "type": "quick_scan", "signal": rsi_15m > 75,
+                        }) + '\n')
+                except Exception:
+                    pass
+
+                if rsi_15m <= 75:
+                    continue
+
+                # 오더북 매수벽 체크 (숏 스퀴즈 방지)
+                try:
+                    ob = client.futures_order_book(symbol=sym, limit=10)
+                    bid = sum(float(b[1]) for b in ob['bids'][:5])
+                    ask = sum(float(a[1]) for a in ob['asks'][:5])
+                    if bid > 0 and ask > 0 and (bid - ask) / (bid + ask) > 0.30:
+                        log(f"  ⚠️ {sym} 메가급등 스킵: 매수벽 강함")
+                        continue
+                except Exception:
+                    pass
+
+                # 진입!
+                px = float(get_price(sym))
+                lev = ALT_LEV
+                set_margin_type(sym, "ISOLATED")
+                set_leverage(sym, lev)
+
+                # SL: +3% 고정 (급등 변동성)
+                sl = _round_price_sym(sym, px * 1.03)
+                # TP: -5% 고정 (STO 실측 -4.5% 기반)
+                tp = _round_price_sym(sym, px * 0.95)
+
+                # 메가급등 진입금: 잔고 20%, 최대 $30 × 킬존 부스트
+                _bal = get_balance() or 100
+                usdt = max(min(_bal * 0.20, 30) * _get_killzone_boost(), 15)
+
+                qty = _round_qty(sym, usdt * lev / px)
+                if qty <= 0 or qty * px < 20:
+                    step, _ = _get_symbol_filters(sym)
+                    qty = _round_qty(sym, 21.0 / px + float(step))
+                if qty <= 0:
+                    continue
+
+                # 손실 캡
+                _sl_pct = 3.0
+                _max_usdt = MAX_LOSS_PER_TRADE / (lev * _sl_pct / 100)
+                if usdt > _max_usdt:
+                    usdt = _max_usdt
+                    qty = _round_qty(sym, usdt * lev / px)
+                if qty <= 0:
+                    continue
+
+                # 시장가 즉시 숏
+                order = client.futures_create_order(
+                    symbol=sym, side='SELL', type='MARKET',
+                    quantity=str(qty), newClientOrderId=f'qs_{uuid.uuid4().hex[:16]}')
+
+                time.sleep(0.3)
+                # SL/TP 즉시 배치
+                try:
+                    client.futures_create_order(symbol=sym, side='BUY', type='STOP_MARKET',
+                        stopPrice=str(sl), quantity=str(qty), reduceOnly=True)
+                except: pass
+                try:
+                    client.futures_create_order(symbol=sym, side='BUY', type='TAKE_PROFIT_MARKET',
+                        stopPrice=str(tp), quantity=str(qty), reduceOnly=True)
+                except: pass
+
+                _entry_source[sym] = 'mega_surge'
+                _entry_time[sym] = time.time()
+                _tp_cache[sym] = tp
+                _surge_entered_today.add(sym)
+
+                # DB 기록
+                try:
+                    trade_db.record_trade({
+                        "time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        "symbol": sym, "side": "🔴 숏", "action": "진입",
+                        "qty": qty, "price": px, "sl": sl, "tp": tp, "atr": 0,
+                        "confidence": 0, "source": "mega_surge",
+                        "extra": json.dumps({"chg_24h": round(chg, 1), "rsi_15m": round(rsi_15m), "type": "mega_surge"}),
+                    })
+                except: pass
+
+                log(f"  🔥🔥 메가급등 즉시숏: {sym} +{chg:.0f}% @ {px} RSI15m={rsi_15m:.0f}")
+                send_message(TG_TOKEN, TG_CHAT,
+                    f"🔥🔥 <b>메가 급등 숏!</b>\n"
+                    f"   {sym} @ ${px} (24h <b>+{chg:.0f}%</b>)\n"
+                    f"   15m RSI={rsi_15m:.0f} Vol=${vol/1e6:.0f}M\n"
+                    f"   SL ${sl} (+3%) → TP ${tp} (-5%)")
+                _sltp_done.add(sym)  # verify_sltp 덮어쓰기 방지
+                _institutional_post_entry(sym, 'mega_surge')
+                break  # 1종목만
+
+            except Exception as e:
+                log(f"  ❌ 메가급등 {sym} 실패: {e}")
+                continue
+
+    except Exception as e:
+        if 'Timestamp' not in str(e):  # 타임스탬프 에러는 무시
+            log(f"  급등스캔 오류: {e}")
+
+
 def check_trend_short():
     """
     추세 추종 숏 — 하락장에서 약한 종목 숏
@@ -2814,9 +3425,9 @@ def check_trend_short():
         return
     _trend_short_cache['ts'] = now
 
-    # 하락장 확인: BTC RSI < 40
+    # 하락장 확인: BTC RSI < 35 (40→35, 더 확실한 하락장만)
     _btc_rsi = _btc_cache.get('rsi', 50)
-    if _btc_rsi >= 40:
+    if _btc_rsi >= 35:
         return
 
     ok, reason = _institutional_guard()
@@ -2858,13 +3469,13 @@ def check_trend_short():
 
                 bb_pos = (px - bb_lower) / (bb_upper - bb_lower) * 100
 
-                # 조건: RSI < 40 + BB pos < 25% (하방 모멘텀)
-                # 거래량 조건은 선택적 가산 (없어도 진입 가능)
+                # 조건: RSI < 40 + BB pos < 25% + ADX > 25 (확실한 하방 추세)
                 is_weak = rsi < 40
                 is_at_low = bb_pos < 25
+                is_trending = adx > 25  # ADX 필터 추가 (추세 확인)
                 _vol_bonus = volume > vol_avg * 1.2 if vol_avg > 0 else False
 
-                is_signal = is_weak and is_at_low
+                is_signal = is_weak and is_at_low and is_trending
 
                 # 로그
                 if is_weak and is_at_low:
@@ -2904,7 +3515,9 @@ def check_trend_short():
                 if _daily_trades.get('date') == _today and _daily_trades.get('count', 0) >= MAX_DAILY_TRADES:
                     break
 
-                usdt = TREND_SHORT_USDT
+                # 추세숏 진입금: 잔고 20%, 최대 $30 × 킬존 부스트
+                _bal = get_balance() or 100
+                usdt = max(min(_bal * 0.20, 30) * _get_killzone_boost(), 15)
                 lev = ETH_LEV if sym == 'ETHUSDT' else ALT_LEV
                 try:
                     set_margin_type(sym, "ISOLATED")
@@ -2998,9 +3611,9 @@ def check_contrarian_short():
         return
     _contrarian_short_cache['ts'] = now
 
-    # 하락장 확인: BTC RSI < 50
+    # 하락장 확인: BTC RSI < 45 (50→45, 더 확실한 하락장만)
     _btc_rsi = _btc_cache.get('rsi', 50)
-    if _btc_rsi >= 50:
+    if _btc_rsi >= 45:
         return
 
     ok, reason = _institutional_guard()
@@ -3037,10 +3650,10 @@ def check_contrarian_short():
 
                 bb_pos = (px - bb_lower) / (bb_upper - bb_lower) * 100
 
-                # 조건: RSI > 60 + BB pos > 60% + ADX > 25 (과매수 + 추세 존재)
-                is_overbought = rsi > 60
-                is_high = bb_pos > 60
-                is_trending = adx > 25
+                # 조건 강화 (AIA 패턴 학습: RSI 70, ADX 67, BB 75%에서 +8.5%)
+                is_overbought = rsi > 70   # 65→70 (극단적 과매수만)
+                is_high = bb_pos > 70      # 상단 근처
+                is_trending = adx > 50     # 과도한 추세 = 되돌림 확률↑
 
                 is_signal = is_overbought and is_high and is_trending
 
@@ -3077,7 +3690,9 @@ def check_contrarian_short():
                 if _daily_trades.get('date') == _today and _daily_trades.get('count', 0) >= MAX_DAILY_TRADES:
                     break
 
-                usdt = CONTRARIAN_SHORT_USDT
+                # 역행숏 진입금: 잔고의 35%, 최대 $50
+                _bal = get_balance() or 100
+                usdt = max(min(_bal * 0.35, 50) * _get_killzone_boost(), 15)
                 lev = ETH_LEV if sym == 'ETHUSDT' else ALT_LEV
                 try:
                     set_margin_type(sym, "ISOLATED")
@@ -3139,8 +3754,8 @@ def check_contrarian_short():
 def check_bb_short():
     """
     BB 박스 숏 — 횡보장에서 상단 매도 → 하단 청산
-    조건: BB 폭 1~5.5% (박스권) + 가격이 상단 근처 + RSI 50~70 + MTF 2/3 상단 합의
-    BTC RSI > 65이면 스킵 (강한 상승장에서 숏 금지)
+    조건: BB 폭 2.5~5.5% + 가격 상단 근처 + RSI 55~70 + MTF 3/3 합의
+    BTC RSI > 55이면 스킵 (상승장 숏 금지) + R:R 최소 0.8
     """
     global _bb_short_cache
     now = time.time()
@@ -3152,8 +3767,9 @@ def check_bb_short():
     if not ok:
         return
 
-    # BTC 강한 상승장 필터
-    if _btc_cache.get('rsi', 50) > 65:
+    # BTC 상승장 필터 — RSI 55 이상이면 숏 금지 (보수적)
+    _btc_rsi = _btc_cache.get('rsi', 50)
+    if _btc_rsi > 55:
         return
 
     try:
@@ -3170,6 +3786,9 @@ def check_bb_short():
             if sym in held or sym in BLACKLIST:
                 continue
             if sym in _cooldown and time.time() < _cooldown[sym]:
+                continue
+            # BB숏 동일 종목 4시간 쿨다운 (연속 손실 방지)
+            if sym in _bb_short_cooldown and time.time() - _bb_short_cooldown[sym] < 14400:
                 continue
 
             try:
@@ -3208,9 +3827,10 @@ def check_bb_short():
 
                 is_box = 1.5 < bb_width < 5.5  # 백테스트 1위와 동일
                 is_mtf_top = _bb_top_count >= 3  # 3/3 전 TF 합의 (보수적)
-                is_overbought_rsi = 50 < rsi < 70
+                is_overbought_rsi = 60 < rsi < 70  # 55→60 (강한 과매수만)
+                is_wide_enough = bb_width >= 3.0  # 2.5→3.0 (밴드 좁으면 R:R 불리)
 
-                is_signal = is_box and is_mtf_top and is_overbought_rsi
+                is_signal = is_box and is_wide_enough and is_mtf_top and is_overbought_rsi
 
                 # 로그
                 if is_box and (_bb_top_count >= 1 or rsi > 60):
@@ -3283,9 +3903,9 @@ def check_bb_short():
                     _sl_min_pct = max(2.0, (_atr_sl / px * 100) if px else 2.0)
                     _sl_min = px * (1 + _sl_min_pct / 100)
                     sl = _round_price_sym(sym, max(_sl_bb, _sl_min))
-                    # TP: BB 하단
-                    tp = _round_price_sym(sym, best['bb_lower'])
-                    if best['bb_lower'] >= px * 0.99:
+                    # TP: BB 중간선 (하단→중간: 도달확률 향상, 부분익절+트레일링이 추가수익 커버)
+                    tp = _round_price_sym(sym, best['bb_mid'])
+                    if best['bb_mid'] >= px * 0.99:
                         continue  # mid가 현재가 가까우면 스킵
                     _mtf = best.get('mtf_top', 0)
 
@@ -3304,6 +3924,9 @@ def check_bb_short():
                         _sl_dist = abs(sl - px)
                         _tp_dist = abs(px - tp)
                         _rr = _tp_dist / _sl_dist if _sl_dist else 0
+                        if _rr < 0.8:
+                            log(f"  ⛔ BB숏 R:R {_rr:.2f} < 0.8 → 스킵 ({sym})")
+                            continue
 
                         order = client.futures_create_order(symbol=sym, side='SELL', type='MARKET', quantity=str(qty), newClientOrderId=f'bbs_{uuid.uuid4().hex[:16]}')
                         _positions_cache['ts'] = 0
@@ -3356,6 +3979,9 @@ def check_bb_short():
                         _sl_dist = abs(sl - limit_px)
                         _tp_dist = abs(limit_px - tp)
                         _rr = _tp_dist / _sl_dist if _sl_dist else 0
+                        if _rr < 0.8:
+                            log(f"  ⛔ BB숏 R:R {_rr:.2f} < 0.8 → 스킵 ({sym})")
+                            continue
 
                         if sym in _bb_short_limit_orders:
                             _old = _bb_short_limit_orders[sym]
@@ -3395,6 +4021,12 @@ def check_cvd_divergence():
     if now - _cvd_cache['ts'] < 300:  # 5분 캐시 (CVD 단독 운영 — 기회 극대화)
         return
     _cvd_cache['ts'] = now
+
+    # CVD 시간대 필터 — 17~19시(KST) 승률 0~33%(완전 실패), 00~04시 100%(최고)
+    _kst_hour = (datetime.now().hour)  # 서버 KST 가정
+    if _kst_hour in (17, 18, 19):
+        return  # CVD 17~19시 차단
+    _cvd_time_boost = 1.3 if _kst_hour in (0, 1, 2, 3, 4) else 1.0
 
     ok, reason = _institutional_guard()
     if not ok:
@@ -3470,10 +4102,10 @@ def check_cvd_divergence():
                 atr = ind.get('atr', 0) or 0  # ATR도 여기서 가져옴 (진입 시 재사용)
 
                 # cvd_trend_up 제거 — 충족률 7%로 거래 차단. cvd_rising이 이미 매수세 확인
-                is_signal = near_low and cvd_rising and rsi < 35  # 45→35 복원 (보수적: 확실한 과매도만)
+                is_signal = near_low and cvd_rising and rsi < 30  # 35→30 (극단적 과매도만)
 
                 # 로그 (조건 부분 충족이라도 기록)
-                if near_low or (rsi < 35 and cvd_rising):
+                if near_low or (rsi < 30 and cvd_rising):
                     try:
                         with open(CVD_LOG, 'a') as f:
                             f.write(json.dumps({
@@ -3492,24 +4124,54 @@ def check_cvd_divergence():
                 if is_signal:
                     # 24시간 거래량 필터 — 저유동성 코인 진입 방지 (BSB -$9.23 사례)
                     _vol_24h = sum(volumes[-24:]) * px  # 24h USDT 거래량 추정
-                    if _vol_24h < 50_000_000:  # $5000만 미만 → 스킵
+                    if _vol_24h < 100_000_000:  # $1억 미만 → 스킵 (5000만→1억, 유동성 강화)
                         log(f"  ⚠️ CVD {sym} 저유동성 스킵 (24h vol ${_vol_24h/1e6:.0f}M)")
                         continue
                     # cvd_delta를 % 정규화 (거래량 큰 종목 편향 방지)
                     _cvd_delta_pct = abs(cvd_now - cvd_12h_low) / abs(cvd_12h_low) * 100 if cvd_12h_low != 0 else 0
+                    # CVD delta 최소 임계값 — delta↔PnL 상관 r=+0.789, 약한 시그널 필터
+                    if _cvd_delta_pct < 5.0:
+                        log(f"  ⚠️ CVD {sym} 약한 시그널 스킵 (delta {_cvd_delta_pct:.1f}% < 5%)")
+                        continue
+                    # OI+가격 방향 조합 보너스 (OI증가+가격하락 = 숏축적 → 숏스퀴즈 롱 유리)
+                    _oi_bonus = 0
+                    try:
+                        _oi = get_oi_change(sym, '15m', 3)
+                        if _oi and _oi.get('change_pct', 0) > 3 and rsi < 35:
+                            _oi_bonus = 5  # OI 증가 + 과매도 = 숏 축적 중 → 롱 보너스
+                    except:
+                        pass
+
                     signals.append({
                         'symbol': sym, 'price': px, 'rsi': rsi,
                         'cvd_delta': round(_cvd_delta_pct, 1),
-                        'atr': atr,  # 진입 시 재사용
+                        'atr': atr,
+                        'oi_bonus': _oi_bonus,
                     })
 
             except Exception as _e:
                 log(f"  ⚠️ CVD {sym} 스캔 오류: {str(_e)[:60]}")
                 continue
 
+        # 펀딩비 연속 극단 보너스 (3회 연속 -0.03% 이하 = 숏 과밀 → 롱 우선순위 UP)
+        for sig in signals:
+            try:
+                _fr_hist = get_funding_rate_history(sig['symbol'], limit=4)
+                if _fr_hist and len(_fr_hist) >= 3:
+                    _fr_vals = [float(f['fundingRate']) for f in _fr_hist[-3:]]
+                    if all(v < -0.0003 for v in _fr_vals):
+                        sig['funding_boost'] = -15  # 낮을수록 우선순위↑ (정렬 기준)
+                        log(f"  💰 {sig['symbol']} 펀딩비 3연속 극음수 → 숏스퀴즈 보너스")
+                    else:
+                        sig['funding_boost'] = 0
+                else:
+                    sig['funding_boost'] = 0
+            except:
+                sig['funding_boost'] = 0
+
         # 시그널 중 최적 진입 (슬롯 여유 시 최대 2개)
         if signals and len(held) < MAX_ORDERS:
-            ranked = sorted(signals, key=lambda x: x['rsi'] - x['cvd_delta'] * 0.1)
+            ranked = sorted(signals, key=lambda x: x['rsi'] - x['cvd_delta'] * 0.1 + x.get('funding_boost', 0))
             # 슬롯 여유만큼 진입 (최대 2개)
             _max_entry = min(2, MAX_ORDERS - len(held))
             _entered = 0
@@ -3525,16 +4187,17 @@ def check_cvd_divergence():
                     break
                 log(f"  📊 CVD 다이버전스 감지: {sym} RSI={best['rsi']:.0f} CVD↑{best['cvd_delta']}%")
 
-                # CVD 진입금 $35 (소수 정예 — 대형코인 제외 후 건당 크기 인상)
-                usdt = max(35 * (0.7 if _bear_mode else 1.0), 15)
+                # CVD 진입금: 잔고의 45% (복리), 최대 $65, 최소 $15
+                _bal = get_balance() or 100
+                usdt = max(min(_bal * 0.45, 65) * (0.7 if _bear_mode else 1.0) * _cvd_time_boost * _get_killzone_boost(), 15)
                 lev = ETH_LEV if sym == 'ETHUSDT' else ALT_LEV
                 try:
                     set_margin_type(sym, "ISOLATED")
                     set_leverage(sym, lev)
                     px = float(get_price(sym))
-                    # ATR 기반 진입 오프셋 (체결률 개선: 변동성 큰 종목은 더 아래, 작은 종목은 가까이)
+                    # ATR 기반 진입 오프셋 (체결률 개선: 오프셋 축소로 10분 내 체결 확률 향상)
                     _atr_tmp = best.get('atr', 0) or 0
-                    _offset = min(max(_atr_tmp * 0.3 / px if px else 0.005, 0.002), 0.008)  # 0.2~0.8%
+                    _offset = min(max(_atr_tmp * 0.2 / px if px else 0.003, 0.001), 0.005)  # 0.1~0.5%
                     limit_px = _round_price_sym(sym, px * (1 - _offset))
 
                     qty = _round_qty(sym, usdt * lev / px)
@@ -3554,7 +4217,7 @@ def check_cvd_divergence():
 
                     _sl_mult = 2.0 if _btc_cache.get('rsi', 50) < 45 else 1.5  # 하락장 SL 넓게
                     sl_pct = max(atr_pct * _sl_mult, 2.0 / lev)
-                    tp_pct = max(atr_pct * 3.0, sl_pct * 2.0)  # TP 도달률 개선
+                    tp_pct = max(atr_pct * 4.0, sl_pct * 2.5)  # TP 확대 (TP효율 119% → 초과 이동분 캡처)
                     sl = _round_price_sym(sym, limit_px * (1 - sl_pct / 100))  # SL/TP도 LIMIT 가격 기준
                     tp = _round_price_sym(sym, limit_px * (1 + tp_pct / 100))
 
@@ -3568,6 +4231,7 @@ def check_cvd_divergence():
                         'side': 'BUY', 'entry': limit_px, 'score': 0, 'atr': atr,
                         'time': time.time(), 'source': 'cvd_divergence',
                         'expire': time.time() + 600,  # 5→10분 (체결률 개선)
+                        'cvd_delta': best.get('cvd_delta', 0),  # delta 기록 (필터 효과 검증용)
                     }
                     # DB 기록은 check_fills() 체결 시에만 (LIMIT 미체결 유령 방지)
                     _rr = tp_pct / sl_pct if sl_pct else 0
@@ -4285,7 +4949,7 @@ def update_cycle():
     daily_limit_hit = _daily_trades['count'] >= MAX_DAILY_TRADES
 
     # 연속 손실 시 진입금 축소 (2연패 50%, 3연패+ 진입 중단)
-    global _consecutive_losses, _bear_stopped, _bear_daily_loss
+    global _consecutive_losses, _bear_stopped, _bear_daily_loss, _global_cooldown_until
     # #J/K: 하락장 일일 리셋
     if _bear_daily_loss['date'] != today:
         _bear_daily_loss = {'date': today, 'total': 0.0}
@@ -4293,8 +4957,16 @@ def update_cycle():
 
     if _bear_stopped and _bear_mode:
         loss_block = True
+    elif time.time() < _global_cooldown_until:
+        loss_block = True  # 연패 시간 쿨다운 중
+    elif _consecutive_losses >= 5:
+        _bear_stopped = True  # 5연패+ → 당일 거래 정지 (승률 0%)
+        loss_block = True
+    elif _consecutive_losses >= 4:
+        _global_cooldown_until = time.time() + 7200  # 4연패 → 2시간 쿨다운
+        loss_block = True
     elif _consecutive_losses >= 3:
-        # #J: 하락장 3연패 → 당일 완전 정지 (일반은 1사이클 쉬고 재개)
+        _global_cooldown_until = time.time() + 1800  # 3연패 → 30분 쿨다운
         if _bear_mode:
             _bear_stopped = True
         loss_block = True
@@ -4317,10 +4989,12 @@ def update_cycle():
         candidates = []
     elif loss_block:
         if _bear_stopped:
-            log(f"  🛑 하락장 3연패 → 당일 거래 정지")
+            log(f"  🛑 {_consecutive_losses}연패 → 당일 거래 정지")
+        elif time.time() < _global_cooldown_until:
+            _remain = int(_global_cooldown_until - time.time())
+            log(f"  🛑 연속 {_consecutive_losses}패 쿨다운 중 (잔여 {_remain//60}분{_remain%60}초)")
         else:
-            log(f"  🛑 연속 {_consecutive_losses}패 → 진입 중단 (다음 사이클까지 대기)")
-            _consecutive_losses = 0  # 리셋 (1사이클 쉬고 재개)
+            log(f"  🛑 연속 {_consecutive_losses}패 → 쿨다운 시작")
         candidates = []
 
     # 전체 스캔 결과 로그
@@ -4458,7 +5132,7 @@ def update_cycle():
     # if _bear_mode and slots > 0:
     #     check_funding_long()
     # manage_crash_buys()
-    # check_pair_divergence()
+    # check_pair_divergence()    # SOL 페어 OFF — 실전 10건 30% PF 0.10, 최근 5연패
     # check_liquidation_bounce()
     # scan_listing_announcements()
     # check_listing_short()
@@ -4466,12 +5140,14 @@ def update_cycle():
     # 활성 전략: CVD + BB 롱/숏 + 추세숏 + 역행숏
     check_cvd_divergence()       # CVD 다이버전스 (BTC RSI>45일 때만)
     check_bb_box()               # BB 롱 (BTC RSI>50일 때만)
-    check_bb_short()             # BB 숏 (횡보장 상단)
+    # check_bb_short()           # BB 숏 OFF — PF 0.06, 최근 1승5패, 방향 문제 (데이터 축적 후 재검토)
     check_trend_short()          # 추세 숏 (하락장 모멘텀)
     check_contrarian_short()     # 역행 숏 (하락장에서 과매수 알트)
+    check_momentum_breakout()    # 모멘텀 롱 (중립장 추세 초기, BTC RSI 45~65)
+    check_surge_short()          # 급등숏 (24h +30% + RSI 80+ 역행)
 
     # 나머지 기관 전략 OFF (데이터 축적 후 재검토)
-    # check_short_squeeze()        # #M
+    check_short_squeeze()        # #M 숏스퀴즈 롱 — 롱숏비율+OI 기반, 소액 $15
     # check_mtf_confluence()       # #N
     # check_vwap_reversion()       # #O: -$1.77
     # check_volume_profile()       # #P
@@ -4576,6 +5252,11 @@ def verify_sltp():
             if sym in _sltp_done:
                 continue
             if sym in _pending_fills:
+                continue
+            # 외부 모니터 포지션 보호 — _entry_source에 없으면 스킵
+            if sym not in _entry_source:
+                _sltp_done.add(sym)  # 다음 체크 방지
+                log(f"  ℹ️ {sym} 외부 포지션 감지 → SL/TP 재배치 스킵")
                 continue
 
             # 미추적 포지션 → ATR 기반 SL/TP 배치 (롱/숏 자동 판별)
@@ -4700,7 +5381,7 @@ def daily_summary():
 _funding_cycle = 0  # 펀딩비 체크 사이클 카운터
 
 def main():
-    global _funding_cycle
+    global _funding_cycle, _consecutive_losses, _global_cooldown_until, _bear_stopped, _bear_daily_loss
 
     # #S: 이중 인스턴스 방지 — PID lock 파일
     import fcntl
@@ -4762,6 +5443,9 @@ def main():
             _held = get_held_symbols()
             for sym in (_sltp_done - _held):
                 _cooldown[sym] = time.time() + COOLDOWN_SEC
+                # BB숏 동일 종목 4시간 재진입 쿨다운
+                if _entry_source.get(sym) == 'bb_short':
+                    _bb_short_cooldown[sym] = time.time()
                 # DB 미청산 거래 자동 정리 (SL/TP 히트 감지)
                 try:
                     _trades_api = get_client().futures_account_trades(symbol=sym, limit=10)
@@ -4817,11 +5501,15 @@ def main():
                             log(f"  ⏳ {sym} 손절 → 연속 {_consecutive_losses}패 | {COOLDOWN_LOSS_SEC//60}분 쿨다운")
                         else:
                             _consecutive_losses = 0
+                            _global_cooldown_until = 0  # 익절 → 연패 쿨다운도 해제
                             log(f"  ⏳ {sym} 익절 → 연패 리셋 | {COOLDOWN_SEC//60}분 쿨다운")
                     else:
                         log(f"  ⏳ {sym} 청산 → {COOLDOWN_SEC//60}분 쿨다운")
-                except Exception:
-                    log(f"  ⏳ {sym} 청산 → {COOLDOWN_SEC//60}분 쿨다운")
+                except Exception as _pnl_err:
+                    # DB 조회 실패해도 안전하게 손실로 간주 (연패 카운터 누락 방지)
+                    _consecutive_losses += 1
+                    _cooldown[sym] = time.time() + COOLDOWN_LOSS_SEC
+                    log(f"  ⚠️ {sym} PnL 조회 실패({_pnl_err}) → 손실 간주, 연속 {_consecutive_losses}패")
             # #150: RL v2 학습 데이터 수집 — 청산 시 30분봉 스냅샷 저장
             for _closed_sym in (_sltp_done - _held):
                 try:
@@ -4872,10 +5560,10 @@ def main():
                 if sym not in _held:
                     del _sl_synced[sym]
             update_cycle()
-            # 펀딩비 체크 OFF (CVD 단독 운영)
-            # _funding_cycle += 1
-            # if _funding_cycle % 6 == 0:
-            #     check_extreme_funding()
+            # 펀딩비 극단 감지 (30분마다, 상위 10종목 ±0.1% 극단)
+            _funding_cycle += 1
+            if _funding_cycle % 6 == 0:
+                check_extreme_funding()
             daily_summary()
         except Exception as e:
             log(f"사이클 오류: {e}")
@@ -4889,6 +5577,7 @@ def main():
                 check_fills()  # LIMIT 체결 감지 → SL/TP 즉시 배치
                 check_trailing_stop()
                 verify_sltp()  # SL/TP 누락 자동 감지 + 재배치 (2분마다)
+                _quick_surge_scan()  # 30초마다 24h +80%+ 메가급등 캐치
             except Exception:
                 pass
 
