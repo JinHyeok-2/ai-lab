@@ -41,7 +41,8 @@ NIGHT_HOURS = set()  # 야간 차단 해제 — 데이터 축적 후 재판단 (
 BLACKLIST = {'BRUSDT', 'SIRENUSDT', 'XAUUSDT', 'XAGUSDT', 'RIVERUSDT', 'SIGNUSDT', 'PAXGUSDT', 'BSBUSDT',
              'A2ZUSDT', 'PTBUSDT', 'VIDTUSDT', 'MEMEFIUSDT', 'AMBUSDT', 'TROYUSDT', 'LEVERUSDT', 'NOMUSDT',
              'PORT3USDT', 'NEIROETHUSDT', 'BSWUSDT', 'AGIXUSDT', 'SXPUSDT',
-             'ALPACAUSDT', 'BNXUSDT', 'ALPHAUSDT', 'LINAUSDT'}  # + get_price 에러
+             'ALPACAUSDT', 'BNXUSDT', 'ALPHAUSDT', 'LINAUSDT',
+             'STOUSDT', 'ONTUSDT'}  # STO/ONT: 반복진입 손실 → 영구 차단
 # 성과 기반 위험 종목 (승률 0~33%) — BB/CVD 진입 제외
 WEAK_SYMBOLS = {'ETHUSDT', 'DOGEUSDT', 'ONTUSDT', 'TAOUSDT'}  # ETH 0%, DOGE 0%, ONT 0%, TAO 33%
 TG_TOKEN = TELEGRAM_TOKEN
@@ -159,11 +160,11 @@ def get_scan_universe():
     """ETH 고정 + 거래량 상위 알트 동적 선택 (10분 캐시)"""
     now = time.time()
     if now - _scan_cache['ts'] < 600 and _scan_cache['symbols']:
-        return _scan_cache['symbols']
+        return [s for s in _scan_cache['symbols'] if s not in BLACKLIST]
     try:
         alts = get_alt_futures_symbols(SCAN_ALT_COUNT)
-        alt_syms = [s for s in alts if s not in SCAN_FIXED][:SCAN_ALT_COUNT]
-        result = SCAN_FIXED + alt_syms
+        alt_syms = [s for s in alts if s not in SCAN_FIXED and s not in BLACKLIST][:SCAN_ALT_COUNT]
+        result = [s for s in SCAN_FIXED if s not in BLACKLIST] + alt_syms
         _scan_cache.update({'ts': now, 'symbols': result})
         return result
     except Exception:
