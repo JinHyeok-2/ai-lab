@@ -2572,7 +2572,7 @@ def check_bb_box():
 
     # 하락장 필터: BTC RSI < 40 + ADX > 25이면 BB 롱 스킵 (역추세 방지)
     _btc_rsi = _btc_cache.get('rsi', 50)
-    if _btc_rsi < 50:  # 40→50 (그리드서치 최적: BTC>50, PF 1.41)
+    if _btc_rsi < 45:  # 50→45 복원 (실전 검증)
         return
 
     try:
@@ -3425,7 +3425,7 @@ def check_cvd_divergence():
 
         # BTC 하락 중이면 CVD 롱 스킵 (손실 11건 대부분 BTC 하락장)
         _btc_rsi_1h = _btc_cache.get('rsi', 50)
-        if _btc_rsi_1h < 50:  # 45→50 (그리드서치 최적: BTC>50)
+        if _btc_rsi_1h < 45:  # 50→45 복원 (실전 31건 58% +$5.28)
             return
 
         # 대형 코인 CVD 제외 (반등폭 부족 → 소액 수익만): SOL 4건-$0.32, ETH 2건-$0.80, BNB 2건-$0.29
@@ -3487,7 +3487,7 @@ def check_cvd_divergence():
                 atr = ind.get('atr', 0) or 0  # ATR도 여기서 가져옴 (진입 시 재사용)
 
                 # cvd_trend_up 제거 — 충족률 7%로 거래 차단. cvd_rising이 이미 매수세 확인
-                is_signal = near_low and cvd_rising and rsi < 33  # 35→33 (그리드서치 최적: RSI<33)
+                is_signal = near_low and cvd_rising and rsi < 35  # 33→35 복원 (실전 검증)
 
                 # 로그 (조건 부분 충족이라도 기록)
                 if near_low or (rsi < 35 and cvd_rising):
