@@ -26,7 +26,7 @@ import trade_db
 
 # ── 설정 ──
 INTERVAL = 300          # 5분
-MAX_ORDERS = 2          # 4→2 (보수적: 집중 투자)
+MAX_ORDERS = 1          # 2→1 (긴급: 연쇄 손실 방지, 안정화 후 복원)
 ETH_USDT = 30           # ETH 진입금 (25→30, 1%/일 목표)
 ALT_USDT = 30           # 알트 진입금 (25→30, BB 건당 수익 강화)
 ALT_USDT_MAX = 60       # 노셔널 상한 (ETH $20×3x=60, ALT $20×2x=40)
@@ -1020,14 +1020,24 @@ def check_fills():
                 if _db_trade and _src in ('bb_box', 'bb_short'):
                     sl = _db_trade[0].get('sl', 0)
                     tp = _db_trade[0].get('tp', 0)
+                elif _db_trade and _db_trade[0].get('sl', 0) and _db_trade[0].get('tp', 0):
+                    # DB에 SL/TP 있으면 복원 (surge_short 등도)
+                    sl = _db_trade[0].get('sl', 0)
+                    tp = _db_trade[0].get('tp', 0)
                 else:
                     i1h = calc_indicators(get_klines(sym, '1h', 60))
                     atr = i1h.get('atr', 0) or 0
                     lev = 3 if sym == 'ETHUSDT' else 2
+                    # ATR 이상치 캡 — 급등 종목 SL +69% 방지 (#버그수정)
+                    atr_pct = atr / entry * 100 if entry else 0
+                    if atr_pct > 15:
+                        atr = entry * 0.05  # 5%로 캡
                     sl_m = 2.0
                     tp_m = 3.0
-                    sl = _round_price_sym(sym, entry - atr * sl_m) if is_long else _round_price_sym(sym, entry + atr * sl_m)
-                    tp = _round_price_sym(sym, entry + atr * tp_m) if is_long else _round_price_sym(sym, entry - atr * tp_m)
+                    _sl_pct = min(atr / entry * sl_m * 100, MAX_SL_PCT / lev) if entry else 3.0
+                    _tp_pct = min(atr / entry * tp_m * 100, 10.0) if entry else 5.0
+                    sl = _round_price_sym(sym, entry * (1 - _sl_pct/100)) if is_long else _round_price_sym(sym, entry * (1 + _sl_pct/100))
+                    tp = _round_price_sym(sym, entry * (1 + _tp_pct/100)) if is_long else _round_price_sym(sym, entry * (1 - _tp_pct/100))
                 if sl and tp:
                     # 1회 배치 (4130이면 이미 존재 → 무시)
                     try:
@@ -4955,12 +4965,13 @@ def update_cycle():
         _bear_daily_loss = {'date': today, 'total': 0.0}
         _bear_stopped = False
 
-    if _bear_stopped and _bear_mode:
+    if _bear_stopped:  # 시장 모드 무관 — 5연패면 당일 정지 (#버그수정: _bear_mode 조건 제거)
         loss_block = True
     elif time.time() < _global_cooldown_until:
         loss_block = True  # 연패 시간 쿨다운 중
     elif _consecutive_losses >= 5:
         _bear_stopped = True  # 5연패+ → 당일 거래 정지 (승률 0%)
+        _global_cooldown_until = time.time() + 86400  # 당일 만료 (24시간)
         loss_block = True
     elif _consecutive_losses >= 4:
         _global_cooldown_until = time.time() + 7200  # 4연패 → 2시간 쿨다운
@@ -5144,10 +5155,11 @@ def update_cycle():
     check_trend_short()          # 추세 숏 (하락장 모멘텀)
     check_contrarian_short()     # 역행 숏 (하락장에서 과매수 알트)
     check_momentum_breakout()    # 모멘텀 롱 (중립장 추세 초기, BTC RSI 45~65)
-    check_surge_short()          # 급등숏 (24h +30% + RSI 80+ 역행)
+    if not loss_block:  # 연패 쿨다운 중이면 모든 전략 차단 (#버그수정)
+        check_surge_short()      # 급등숏 (24h +30% + RSI 80+ 역행)
 
-    # 나머지 기관 전략 OFF (데이터 축적 후 재검토)
-    check_short_squeeze()        # #M 숏스퀴즈 롱 — 롱숏비율+OI 기반, 소액 $15
+    # 나머지 기관 전략 OFF
+    # check_short_squeeze()      # #M OFF — 오늘 ONT -$6.62, SL 20% 비정상
     # check_mtf_confluence()       # #N
     # check_vwap_reversion()       # #O: -$1.77
     # check_volume_profile()       # #P
