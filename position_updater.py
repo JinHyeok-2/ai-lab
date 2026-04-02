@@ -132,13 +132,7 @@ CONTRARIAN_SHORT_LOG = '/home/hyeok/01.APCC/00.ai-lab/contrarian_short_signals.j
 _momentum_cache = {'ts': 0}
 MOMENTUM_USDT = 15  # 소액 검증 ($15)
 MOMENTUM_LOG = '/home/hyeok/01.APCC/00.ai-lab/momentum_signals.jsonl'
-# ── 급등 과매수 숏 (24h 급등 종목 역행) ──
-_surge_short_cache = {'ts': 0}
-SURGE_SHORT_USDT = 20  # STO +$6.10 실증 → $20
-SURGE_SHORT_LOG = '/home/hyeok/01.APCC/00.ai-lab/surge_short_signals.jsonl'
-# ── 메가 급등 실시간 캐치 (30초 주기, 24h +80%+) ──
-_surge_entered_today = set()  # 당일 급등숏 진입 종목 (중복 방지)
-_quick_surge_date = ''        # 날짜 바뀌면 리셋
+# ── 급등숏/메가급등 삭제됨 (4/2 STO 반복진입 -$20+ 원인) ──
 
 # ── 킬존 시간대 부스트 (런던/뉴욕 오픈 = 변동성↑) ──
 def _get_killzone_boost():
@@ -3061,12 +3055,15 @@ def check_momentum_breakout():
         log(f"  모멘텀 오류: {e}")
 
 
-def check_surge_short():
-    """
-    급등 과매수 숏 — 24h 급등(+30%+) + RSI 80+ 종목 역행 숏
-    STO +$6.10 실증 패턴 자동화. BTC RSI 무관 (급등 자체가 시그널)
-    기존 역행숏(contrarian_short)은 BTC RSI<45 제한 → 이 전략은 독립 작동
-    """
+# check_surge_short / _quick_surge_scan 삭제됨 (4/2 STO 반복진입 -$20+ 원인)
+# 재활성화 시 별도 파일로 분리 권장
+
+def _DELETED_surge_all():
+    """급등숏/메가급등 전체 삭제 (4/2 STO -$20+ 원인). 아래 원본 주석 처리."""
+    pass
+
+def _DEAD_check_surge_short():
+    """삭제됨 - 4/2 STO 반복진입 원인. 호출 금지."""
     global _surge_short_cache
     now = time.time()
     if now - _surge_short_cache['ts'] < 300:
