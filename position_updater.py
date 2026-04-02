@@ -4825,8 +4825,9 @@ def main():
                             log(f"  ⏳ {sym} 익절 → 연패 리셋 | {COOLDOWN_SEC//60}분 쿨다운")
                     else:
                         log(f"  ⏳ {sym} 청산 → {COOLDOWN_SEC//60}분 쿨다운")
-                except Exception:
-                    log(f"  ⏳ {sym} 청산 → {COOLDOWN_SEC//60}분 쿨다운")
+                except Exception as _e:
+                    _consecutive_losses += 1  # DB 실패해도 손실 간주 (안전)
+                    log(f"  ⚠️ {sym} PnL조회 실패({_e}) → 손실 간주, 연속 {_consecutive_losses}패")
             # #150: RL v2 학습 데이터 수집 — 청산 시 30분봉 스냅샷 저장
             for _closed_sym in (_sltp_done - _held):
                 try:
