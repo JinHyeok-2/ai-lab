@@ -42,7 +42,7 @@ BLACKLIST = {'BRUSDT', 'SIRENUSDT', 'XAUUSDT', 'XAGUSDT', 'RIVERUSDT', 'SIGNUSDT
              'A2ZUSDT', 'PTBUSDT', 'VIDTUSDT', 'MEMEFIUSDT', 'AMBUSDT', 'TROYUSDT', 'LEVERUSDT', 'NOMUSDT',
              'PORT3USDT', 'NEIROETHUSDT', 'BSWUSDT', 'AGIXUSDT', 'SXPUSDT',
              'ALPACAUSDT', 'BNXUSDT', 'ALPHAUSDT', 'LINAUSDT',
-             'STOUSDT'}  # STO: 4/2 반복 진입/손절 -$11 → 영구 차단
+             'STOUSDT', 'ONTUSDT'}  # STO/ONT: 4/2 반복 진입/손절 → 영구 차단
 # 성과 기반 위험 종목 (승률 0~33%) — BB/CVD 진입 제외
 WEAK_SYMBOLS = {'ETHUSDT', 'DOGEUSDT', 'ONTUSDT', 'TAOUSDT'}  # ETH 0%, DOGE 0%, ONT 0%, TAO 33%
 TG_TOKEN = TELEGRAM_TOKEN
@@ -2681,7 +2681,7 @@ def check_bb_box():
                 is_mtf_bottom = _bb_bottom_count >= 3  # 3/3 전 TF 합의 (보수적)
                 is_sideways_rsi = 30 < rsi < 50  # 55→50 (중립 제외, 과매도만)
 
-                is_signal = is_box and is_mtf_bottom and is_sideways_rsi
+                is_signal = is_box and is_mtf_bottom and is_sideways_rsi and bb_pos >= 2  # bb_pos 음수 = 추가하락, 전손 방지
 
                 # 로그
                 if is_box and (_bb_bottom_count >= 1 or rsi < 40):
@@ -4033,11 +4033,11 @@ def check_cvd_divergence():
         return
     _cvd_cache['ts'] = now
 
-    # CVD 시간대 필터 — 17~19시(KST) 승률 0~33%(완전 실패), 00~04시 100%(최고)
+    # CVD 시간대 필터 — 18~23시(KST) 실전 4건 전패 -$1.24 (백테스트 확인)
     _kst_hour = (datetime.now().hour)  # 서버 KST 가정
-    if _kst_hour in (17, 18, 19):
-        return  # CVD 17~19시 차단
-    _cvd_time_boost = 1.3 if _kst_hour in (0, 1, 2, 3, 4) else 1.0
+    if 17 <= _kst_hour <= 23:
+        return  # CVD 저녁 차단 (17~23시)
+    # 야간 부스트 제거 — 백테스트 야간 67% < 기타 86%, 효과 없음
 
     ok, reason = _institutional_guard()
     if not ok:
@@ -4200,7 +4200,7 @@ def check_cvd_divergence():
 
                 # CVD 진입금: 잔고의 45% (복리), 최대 $65, 최소 $15
                 _bal = get_balance() or 100
-                usdt = max(min(_bal * 0.45, 65) * (0.7 if _bear_mode else 1.0) * _cvd_time_boost * _get_killzone_boost(), 15)
+                usdt = max(min(_bal * 0.45, 65) * (0.7 if _bear_mode else 1.0) * _get_killzone_boost(), 15)
                 lev = ETH_LEV if sym == 'ETHUSDT' else ALT_LEV
                 try:
                     set_margin_type(sym, "ISOLATED")
