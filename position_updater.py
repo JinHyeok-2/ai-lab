@@ -181,7 +181,7 @@ def get_scan_universe():
     """ETH 고정 + 거래량 상위 알트 동적 선택 (10분 캐시)"""
     now = time.time()
     if now - _scan_cache['ts'] < 600 and _scan_cache['symbols']:
-        return _scan_cache['symbols']
+        return [s for s in _scan_cache['symbols'] if s not in BLACKLIST]
     try:
         alts = get_alt_futures_symbols(SCAN_ALT_COUNT)
         alt_syms = [s for s in alts if s not in SCAN_FIXED and s not in BLACKLIST][:SCAN_ALT_COUNT]
