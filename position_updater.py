@@ -2572,7 +2572,7 @@ def check_bb_box():
 
     # 하락장 필터: BTC RSI < 40 + ADX > 25이면 BB 롱 스킵 (역추세 방지)
     _btc_rsi = _btc_cache.get('rsi', 50)
-    if _btc_rsi < 40:  # 50→40 (백테스트 최적: BTC>40, PF 1.43)
+    if _btc_rsi < 50:  # 40→50 (그리드서치 최적: BTC>50, PF 1.41)
         return
 
     try:
@@ -2597,7 +2597,7 @@ def check_bb_box():
                 _bb_bottom_count = 0
                 _bb_1h = None
 
-                for _tf in ['15m', '30m', '1h']:
+                for _tf in ['5m', '15m', '30m']:  # 그리드서치 최적: 5m 기준
                     _ind = calc_indicators(get_klines(sym, _tf, 50))
                     _bu = _ind.get('bb_upper', 0) or 0
                     _bl = _ind.get('bb_lower', 0) or 0
@@ -2605,9 +2605,9 @@ def check_bb_box():
                     if not (_bu > _bl > 0):
                         continue
                     _pos = (px - _bl) / (_bu - _bl) * 100
-                    if -5 < _pos < 25:  # 20→25 (백테스트 BB<25 최적)
+                    if -5 < _pos < 30:  # 25→30 (그리드서치 최적: BB<30)
                         _bb_bottom_count += 1
-                    if _tf == '30m':  # 1h→30m (백테스트 PF 1.43)
+                    if _tf == '5m':  # 30m→5m (그리드서치 최적: PF 1.41)
                         _bb_1h = {
                             'upper': _bu, 'lower': _bl, 'mid': _bm,
                             'pos': _pos, 'width': (_bu - _bl) / _bm * 100,
@@ -3425,7 +3425,7 @@ def check_cvd_divergence():
 
         # BTC 하락 중이면 CVD 롱 스킵 (손실 11건 대부분 BTC 하락장)
         _btc_rsi_1h = _btc_cache.get('rsi', 50)
-        if _btc_rsi_1h < 45:
+        if _btc_rsi_1h < 50:  # 45→50 (그리드서치 최적: BTC>50)
             return
 
         # 대형 코인 CVD 제외 (반등폭 부족 → 소액 수익만): SOL 4건-$0.32, ETH 2건-$0.80, BNB 2건-$0.29
@@ -3487,7 +3487,7 @@ def check_cvd_divergence():
                 atr = ind.get('atr', 0) or 0  # ATR도 여기서 가져옴 (진입 시 재사용)
 
                 # cvd_trend_up 제거 — 충족률 7%로 거래 차단. cvd_rising이 이미 매수세 확인
-                is_signal = near_low and cvd_rising and rsi < 35  # 45→35 복원 (보수적: 확실한 과매도만)
+                is_signal = near_low and cvd_rising and rsi < 33  # 35→33 (그리드서치 최적: RSI<33)
 
                 # 로그 (조건 부분 충족이라도 기록)
                 if near_low or (rsi < 35 and cvd_rising):
@@ -3569,9 +3569,9 @@ def check_cvd_divergence():
                         atr = _ind.get('atr', 0) or 0
                     atr_pct = atr / px * 100 if px else 1
 
-                    _sl_mult = 2.0 if _btc_cache.get('rsi', 50) < 45 else 1.5  # 하락장 SL 넓게
-                    sl_pct = max(atr_pct * _sl_mult, 2.0 / lev)
-                    tp_pct = max(atr_pct * 3.0, sl_pct * 2.0)  # TP 도달률 개선
+                    _sl_mult = 1.0  # 그리드서치 최적: SL×1.0 (타이트)
+                    sl_pct = max(atr_pct * _sl_mult, 1.5 / lev)
+                    tp_pct = max(atr_pct * 4.0, sl_pct * 3.0)  # 그리드서치 최적: TP×4.0
                     sl = _round_price_sym(sym, limit_px * (1 - sl_pct / 100))  # SL/TP도 LIMIT 가격 기준
                     tp = _round_price_sym(sym, limit_px * (1 + tp_pct / 100))
 
