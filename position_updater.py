@@ -4491,7 +4491,7 @@ def update_cycle():
     check_bb_box()               # BB 롱 (BTC RSI>50일 때만)
     check_bb_short()             # BB 숏 (횡보장 상단)
     check_trend_short()          # 추세 숏 (하락장 모멘텀)
-    check_contrarian_short()     # 역행 숏 (하락장에서 과매수 알트)
+    # check_contrarian_short()   # 역행 숏 OFF — 5건 40% -$0.74, STO/ONT 반복진입 원인
 
     # 나머지 기관 전략 OFF (데이터 축적 후 재검토)
     # check_short_squeeze()        # #M
