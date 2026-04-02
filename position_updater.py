@@ -44,7 +44,7 @@ BLACKLIST = {'BRUSDT', 'SIRENUSDT', 'XAUUSDT', 'XAGUSDT', 'RIVERUSDT', 'SIGNUSDT
              'ALPACAUSDT', 'BNXUSDT', 'ALPHAUSDT', 'LINAUSDT',
              'STOUSDT', 'ONTUSDT'}  # STO/ONT: 반복진입 손실 → 영구 차단
 # 성과 기반 위험 종목 (승률 0~33%) — BB/CVD 진입 제외
-WEAK_SYMBOLS = {'ETHUSDT', 'DOGEUSDT', 'ONTUSDT', 'TAOUSDT'}  # ETH 0%, DOGE 0%, ONT 0%, TAO 33%
+WEAK_SYMBOLS = {'ETHUSDT', 'DOGEUSDT', 'ONTUSDT', 'TAOUSDT', 'HYPEUSDT'}  # ETH 0%, DOGE 0%, ONT 0%, TAO 33%, HYPE 0%(-$0.88)
 TG_TOKEN = TELEGRAM_TOKEN
 TG_CHAT  = TELEGRAM_CHAT_ID
 
@@ -1434,7 +1434,7 @@ def check_long_hold():
             # #T: 강제 청산 — CVD는 12h (기관 매집 후 천천히 상승), 나머지 6h
             _source = _entry_source.get(sym, 'updater')
             # CVD 12h, BB/추세숏 8h, 나머지 6h
-            if _source == 'cvd_divergence': _max_hold = 12 * 3600
+            if _source == 'cvd_divergence': _max_hold = 2 * 3600  # 12h→2h (0~30분 90%, 2h+ 22%)
             elif _source in ('bb_box', 'bb_short', 'trend_short', 'contrarian_short'): _max_hold = 8 * 3600
             else: _max_hold = 6 * 3600
             if held_sec >= _max_hold:
