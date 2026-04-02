@@ -5149,15 +5149,15 @@ def update_cycle():
     # scan_listing_announcements()
     # check_listing_short()
 
-    # 활성 전략: CVD + BB 롱/숏 + 추세숏 + 역행숏
-    check_cvd_divergence()       # CVD 다이버전스 (BTC RSI>45일 때만)
-    check_bb_box()               # BB 롱 (BTC RSI>50일 때만)
-    # check_bb_short()           # BB 숏 OFF — PF 0.06, 최근 1승5패, 방향 문제 (데이터 축적 후 재검토)
-    check_trend_short()          # 추세 숏 (하락장 모멘텀)
-    check_contrarian_short()     # 역행 숏 (하락장에서 과매수 알트)
-    check_momentum_breakout()    # 모멘텀 롱 (중립장 추세 초기, BTC RSI 45~65)
-    if not loss_block:  # 연패 쿨다운 중이면 모든 전략 차단 (#버그수정)
-        check_surge_short()      # 급등숏 (24h +30% + RSI 80+ 역행)
+    # 검증된 3전략만 활성 — 안정화 모드 ($84→$100 목표)
+    check_cvd_divergence()       # CVD (10건 80% +$4.93) ✅
+    check_bb_box()               # BB 롱 (10건 60% +$0.61) ✅
+    check_contrarian_short()     # 역행 숏 (2건 100% +$6.91) ✅
+    # === 미검증 전략 OFF (안정화 후 소액 재활성화) ===
+    # check_trend_short()        # 추세숏 — 0건 미검증
+    # check_momentum_breakout()  # 모멘텀롱 — 0건 미검증
+    # check_surge_short()        # 급등숏 — STO 반복손절 -$11 주범
+    # check_bb_short()           # BB숏 — PF 0.06
 
     # 나머지 기관 전략 OFF
     # check_short_squeeze()      # #M OFF — 오늘 ONT -$6.62, SL 20% 비정상
@@ -5574,9 +5574,10 @@ def main():
                     del _sl_synced[sym]
             update_cycle()
             # 펀딩비 극단 감지 (30분마다, 상위 10종목 ±0.1% 극단)
-            _funding_cycle += 1
-            if _funding_cycle % 6 == 0:
-                check_extreme_funding()
+            # 펀딩비 극단 OFF (안정화 모드)
+            # _funding_cycle += 1
+            # if _funding_cycle % 6 == 0:
+            #     check_extreme_funding()
             daily_summary()
         except Exception as e:
             log(f"사이클 오류: {e}")
@@ -5590,7 +5591,7 @@ def main():
                 check_fills()  # LIMIT 체결 감지 → SL/TP 즉시 배치
                 check_trailing_stop()
                 verify_sltp()  # SL/TP 누락 자동 감지 + 재배치 (2분마다)
-                _quick_surge_scan()  # 30초마다 24h +80%+ 메가급등 캐치
+                # _quick_surge_scan()  # 메가급등 OFF (안정화 모드)
             except Exception:
                 pass
 
