@@ -1812,7 +1812,7 @@ def check_liquidation_bounce():
 
         targets = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']
         for sym in targets:
-            if sym in held or sym in BLACKLIST:
+            if sym in held or sym in BLACKLIST or sym in ('STOUSDT','ONTUSDT'):
                 continue
             if sym in _liquidation_cooldown and now < _liquidation_cooldown[sym]:
                 continue
@@ -2162,7 +2162,7 @@ def check_funding_long():
         scan = get_scan_universe()
 
         for sym in scan:
-            if sym in held or sym in BLACKLIST:
+            if sym in held or sym in BLACKLIST or sym in ('STOUSDT','ONTUSDT'):
                 continue
             if sym in _funding_cooldown and now < _funding_cooldown[sym]:
                 continue
@@ -2834,7 +2834,7 @@ def check_trend_short():
         signals = []
 
         for sym in symbols:
-            if sym in held or sym in BLACKLIST:
+            if sym in held or sym in BLACKLIST or sym in ('STOUSDT','ONTUSDT'):
                 continue
             if sym in _cooldown and time.time() < _cooldown[sym]:
                 continue
@@ -3018,7 +3018,7 @@ def check_contrarian_short():
         signals = []
 
         for sym in symbols:
-            if sym in held or sym in BLACKLIST:
+            if sym in held or sym in BLACKLIST or sym in ('STOUSDT','ONTUSDT'):
                 continue
             if sym in _cooldown and time.time() < _cooldown[sym]:
                 continue
@@ -3168,7 +3168,7 @@ def check_bb_short():
         signals = []
 
         for sym in symbols:
-            if sym in held or sym in BLACKLIST:
+            if sym in held or sym in BLACKLIST or sym in ('STOUSDT','ONTUSDT'):
                 continue
             if sym in _cooldown and time.time() < _cooldown[sym]:
                 continue
@@ -3614,7 +3614,7 @@ def check_short_squeeze():
         signals = []
 
         for sym in symbols:
-            if sym in held or sym in BLACKLIST:
+            if sym in held or sym in BLACKLIST or sym in ('STOUSDT','ONTUSDT'):
                 continue
             if sym in _cooldown and time.time() < _cooldown[sym]:
                 continue
@@ -3745,7 +3745,7 @@ def check_mtf_confluence():
         signals = []
 
         for sym in symbols:
-            if sym in held or sym in BLACKLIST:
+            if sym in held or sym in BLACKLIST or sym in ('STOUSDT','ONTUSDT'):
                 continue
             if sym in _cooldown and time.time() < _cooldown[sym]:
                 continue
@@ -3873,7 +3873,7 @@ def check_vwap_reversion():
         signals = []
 
         for sym in symbols:
-            if sym in held or sym in BLACKLIST:
+            if sym in held or sym in BLACKLIST or sym in ('STOUSDT','ONTUSDT'):
                 continue
             if sym in _cooldown and time.time() < _cooldown[sym]:
                 continue
@@ -4018,7 +4018,7 @@ def check_volume_profile():
         signals = []
 
         for sym in symbols:
-            if sym in held or sym in BLACKLIST:
+            if sym in held or sym in BLACKLIST or sym in ('STOUSDT','ONTUSDT'):
                 continue
             if sym in _cooldown and time.time() < _cooldown[sym]:
                 continue
@@ -4185,6 +4185,10 @@ def update_cycle():
     _signal_syms = set()
     if _signals:
         for sig in _signals:
+            # 시그널 큐에서도 BLACKLIST 체크 (app.py surge_detector 우회 방지)
+            if sig['symbol'] in BLACKLIST:
+                log(f"  [시그널큐] {sig['symbol']} 블랙리스트 → 무시")
+                continue
             _signal_syms.add(sig['symbol'])
             log(f"  [시그널큐] {sig['symbol']} ← {sig['source']} (우선순위={sig['priority']})")
 

@@ -5355,6 +5355,10 @@ if BINANCE_READY and st.session_state.get("alt_auto_scan", True):
                     if _sg["score"] < 50:
                         continue
                     _ssym = _sg["symbol"]
+                    # BLACKLIST 체크 (STO 반복진입 방지)
+                    _BL = {'BRUSDT','SIRENUSDT','XAUUSDT','XAGUSDT','RIVERUSDT','SIGNUSDT','PAXGUSDT','BSBUSDT','STOUSDT','ONTUSDT'}
+                    if _ssym in _BL:
+                        continue
                     if (_ssym in st.session_state.alt_analysis
                             or _ssym in _analyzing
                             or _ssym in _pullback_wl):
