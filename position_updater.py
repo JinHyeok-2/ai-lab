@@ -101,6 +101,9 @@ _listing_done = set()  # 이미 숏 진입한 종목 (세션 내 중복 방지)
 # 일일 거래 횟수 + 연속 손실 추적
 _daily_trades = {'date': '', 'count': 0}
 _consecutive_losses = 0
+# 종목별 연패 자동 블랙리스트 (당일)
+_sym_loss_count = {}   # {symbol: 연속 손실 횟수}
+_sym_banned_today = set()  # 당일 자동 차단 종목
 # #J/K: 하락장 전용 안전장치
 _bear_daily_loss = {'date': '', 'total': 0.0}  # 하락장 일일 손실 누적
 _bear_stopped = False  # 하락장 당일 거래 정지 플래그
@@ -2515,7 +2518,9 @@ def _institutional_guard():
 
 
 def _check_already_held(sym):
-    """같은 종목 다전략 진입 차단 — 포지션/pending/예약/연패 체크"""
+    """같은 종목 다전략 진입 차단 — 포지션/pending/예약/연패/자동블랙 체크"""
+    if sym in _sym_banned_today:
+        return True  # 당일 자동 블랙리스트 (3연패)
     if has_position(sym):
         return True
     if sym in _pending_fills:
@@ -4306,6 +4311,8 @@ def update_cycle():
     if _bear_daily_loss['date'] != today:
         _bear_daily_loss = {'date': today, 'total': 0.0}
         _bear_stopped = False
+        _sym_banned_today.clear()  # 당일 자동 블랙리스트 리셋
+        _sym_loss_count.clear()
 
     if _bear_stopped and _bear_mode:
         loss_block = True
@@ -4815,6 +4822,11 @@ def main():
                     if _row and _row[0] is not None:
                         if _row[0] <= 0:
                             _consecutive_losses += 1
+                            # 종목별 연패 자동 블랙리스트
+                            _sym_loss_count[sym] = _sym_loss_count.get(sym, 0) + 1
+                            if _sym_loss_count[sym] >= 3 and sym not in _sym_banned_today:
+                                _sym_banned_today.add(sym)
+                                log(f"  🚫 {sym} 3연패 → 당일 자동 블랙리스트")
                             _cooldown[sym] = time.time() + COOLDOWN_LOSS_SEC
                             # SL 히트 알림
                             try:
@@ -4833,6 +4845,7 @@ def main():
                             log(f"  ⏳ {sym} 손절 → 연속 {_consecutive_losses}패 | {COOLDOWN_LOSS_SEC//60}분 쿨다운")
                         else:
                             _consecutive_losses = 0
+                            _sym_loss_count[sym] = 0  # 종목별 연패 리셋
                             log(f"  ⏳ {sym} 익절 → 연패 리셋 | {COOLDOWN_SEC//60}분 쿨다운")
                     else:
                         log(f"  ⏳ {sym} 청산 → {COOLDOWN_SEC//60}분 쿨다운")
