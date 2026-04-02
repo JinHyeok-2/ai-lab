@@ -2556,7 +2556,7 @@ def check_bb_box():
 
     # 하락장 필터: BTC RSI < 40 + ADX > 25이면 BB 롱 스킵 (역추세 방지)
     _btc_rsi = _btc_cache.get('rsi', 50)
-    if _btc_rsi < 50:  # 40→50 (BTC가 중립 이상일 때만 롱)
+    if _btc_rsi < 40:  # 50→40 (백테스트 최적: BTC>40, PF 1.43)
         return
 
     try:
@@ -2589,9 +2589,9 @@ def check_bb_box():
                     if not (_bu > _bl > 0):
                         continue
                     _pos = (px - _bl) / (_bu - _bl) * 100
-                    if -5 < _pos < 20:
+                    if -5 < _pos < 25:  # 20→25 (백테스트 BB<25 최적)
                         _bb_bottom_count += 1
-                    if _tf == '1h':
+                    if _tf == '30m':  # 1h→30m (백테스트 PF 1.43)
                         _bb_1h = {
                             'upper': _bu, 'lower': _bl, 'mid': _bm,
                             'pos': _pos, 'width': (_bu - _bl) / _bm * 100,
@@ -2611,7 +2611,7 @@ def check_bb_box():
                 if rsi != rsi: continue  # nan
 
                 # 조건: 1h 박스권(폭 1~4%) + 2/3 TF 하단 합의 + RSI 횡보(30~55)
-                is_box = 1.5 < bb_width < 5.5  # 백테스트 1위: 1.5~5.5%
+                is_box = 2.5 < bb_width < 6.0  # 백테스트 최적: 2.5~6.0%
                 is_mtf_bottom = _bb_bottom_count >= 3  # 3/3 전 TF 합의 (보수적)
                 is_sideways_rsi = 30 < rsi < 55  # 백테스트 1위: 55
 
@@ -2815,9 +2815,9 @@ def check_trend_short():
         return
     _trend_short_cache['ts'] = now
 
-    # 하락장 확인: BTC RSI < 40
+    # 하락장 확인: BTC RSI < 30 (백테스트 최적: PF 3.06, 421건)
     _btc_rsi = _btc_cache.get('rsi', 50)
-    if _btc_rsi >= 40:
+    if _btc_rsi >= 30:
         return
 
     ok, reason = _institutional_guard()
@@ -2841,15 +2841,15 @@ def check_trend_short():
 
             try:
                 px = float(get_price(sym))
-                ind = calc_indicators(get_klines(sym, '1h', 50))
+                ind = calc_indicators(get_klines(sym, '5m', 50))  # 1h→5m (백테스트 PF 3.06)
                 rsi = ind.get('rsi', 50) or 50
                 adx = ind.get('adx', 0) or 0
                 atr = ind.get('atr', 0) or 0
                 bb_upper = ind.get('bb_upper', 0) or 0
                 bb_lower = ind.get('bb_lower', 0) or 0
                 bb_mid = ind.get('bb_mid', 0) or 0
-                # 거래량 직접 계산 (indicators에 없으므로)
-                _kl = get_klines(sym, '1h', 20)
+                # 거래량 직접 계산
+                _kl = get_klines(sym, '5m', 20)  # 1h→5m
                 _vols = _kl['volume'].tolist() if hasattr(_kl, 'tolist') else [float(k[5]) for k in _kl]
                 volume = _vols[-1] if _vols else 0
                 vol_avg = sum(_vols[:-1]) / max(len(_vols) - 1, 1) if len(_vols) > 1 else volume
